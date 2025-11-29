@@ -1,12 +1,10 @@
-import { Platform } from 'react-native';
-import RNFS from 'react-native-fs';
 import { Fact } from '../types/Fact';
 import { Interaction } from '../types/Interaction';
 import { PreferenceAnalysis } from '../types/Preferences';
 import { getModelConfig, type ModelConfig } from '../utils/modelLoader';
 
 export type AIProgressEvent =
-  | { type: 'model-download'; modelId: string; progress: number }
+  | { type: 'model-download'; progress: number }
   | { type: 'parse-start'; topic: string; totalChunks: number }
   | { type: 'parse-chunk-start'; topic: string; chunkIndex: number; totalChunks: number }
   | {
@@ -46,26 +44,13 @@ try {
   console.warn('cactus-react-native not found. AI features will not work until installed.');
 }
 
-let CactusFileSystem: any = null;
-if (CactusLMClass) {
-  try {
-    CactusFileSystem = require('cactus-react-native/lib/module/native/CactusFileSystem').CactusFileSystem;
-  } catch {
-    try {
-      CactusFileSystem = require('cactus-react-native/src/native/CactusFileSystem').CactusFileSystem;
-    } catch {
-      CactusFileSystem = null;
-    }
-  }
-}
-
 class AIService {
   private lm: any = null;
   private initialized = false;
   private initializing = false;
-  private currentModelId: string | null = null;
-  private downloadProgress: Record<string, number> = {};
+  private lastDownloadPercent: number | null = null;
   private progressListeners = new Set<ProgressListener>();
+  private fallbackEnabled = false;
 
   subscribeProgress(listener: ProgressListener): () => void {
     this.progressListeners.add(listener);
@@ -84,69 +69,22 @@ class AIService {
     });
   }
 
-  private getCandidateModels(config: ModelConfig): string[] {
-    const candidates = new Set<string>();
-    if (config.modelId) {
-      candidates.add(config.modelId);
-    }
-    if (config.fallbackModelId) {
-      candidates.add(config.fallbackModelId);
-    }
-    return Array.from(candidates);
-  }
-
-  private createModelInstance(modelId: string, contextSize: number): any {
+  private createModelInstance(
+    contextSize: number,
+  ): any {
     if (!CactusLMClass) {
       return null;
     }
-    return new CactusLMClass({ model: modelId, contextSize });
-  }
-
-  private async isModelCached(modelId: string): Promise<boolean> {
-    if (!CactusFileSystem) {
-      return false;
-    }
-
-    try {
-      return await CactusFileSystem.modelExists(modelId);
-    } catch (error) {
-      console.warn(`[AIService] Failed to query Cactus model cache for "${modelId}":`, error);
-      return false;
-    }
-  }
-
-  private async installBundledModel(modelId: string, assetFileName: string): Promise<boolean> {
-    if (!CactusFileSystem || Platform.OS !== 'android') {
-      return false;
-    }
-
-    try {
-      const cactusDir: string = await CactusFileSystem.getCactusDirectory();
-      const modelDir = `${cactusDir}/models/${modelId}`;
-      const destination = `${modelDir}/${assetFileName}`;
-
-      const exists = await RNFS.exists(destination);
-      if (exists) {
-        return true;
-      }
-
-      await RNFS.mkdir(modelDir, { NSURLIsExcludedFromBackupKey: true });
-      await RNFS.copyFileAssets(`models/${assetFileName}`, destination);
-      console.log(`[AIService] Seeded bundled model asset at ${destination}`);
-      return true;
-    } catch (error) {
-      console.error(`[AIService] Failed to seed bundled model asset "${assetFileName}":`, error);
-      return false;
-    }
+    return new CactusLMClass({
+      contextSize,
+    });
   }
 
   private async prepareModelInstance(
-    modelId: string,
     config: ModelConfig,
-    allowBundledSeed: boolean,
   ): Promise<any> {
     const contextSize = config.contextSize ?? 2048;
-    const instance = this.createModelInstance(modelId, contextSize);
+    const instance = this.createModelInstance(contextSize);
 
     if (!instance) {
       throw new Error(
@@ -154,21 +92,8 @@ class AIService {
       );
     }
 
-    if (await this.isModelCached(modelId)) {
-      return instance;
-    }
-
-    if (
-      allowBundledSeed &&
-      config.useBundledAsset &&
-      config.assetFileName &&
-      (await this.installBundledModel(modelId, config.assetFileName)) &&
-      (await this.isModelCached(modelId))
-    ) {
-      return instance;
-    }
-
-    if (typeof instance.download === 'function') {
+    if (config.preloadModel !== false && typeof instance.download === 'function') {
+      this.lastDownloadPercent = null;
       try {
         await instance.download({
           onProgress: (progress: number) => {
@@ -176,23 +101,25 @@ class AIService {
               return;
             }
             const pct = Math.round(progress * 100);
-            if (this.downloadProgress[modelId] === pct) {
+            if (this.lastDownloadPercent === pct) {
               return;
             }
-            this.downloadProgress[modelId] = pct;
+            this.lastDownloadPercent = pct;
             if (pct % 5 === 0 || pct === 100) {
-              console.log(`[AIService] Downloading model "${modelId}"… ${pct}%`);
+              console.log(`[AIService] Downloading Cactus model… ${pct}%`);
             }
-            this.emitProgress({ type: 'model-download', modelId, progress });
+            this.emitProgress({ type: 'model-download', progress });
           },
         });
         return instance;
       } catch (error) {
-        throw new Error(`Failed to download Cactus model "${modelId}": ${error instanceof Error ? error.message : String(error)}`);
+        throw new Error(
+          `Failed to download Cactus model: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
 
-    throw new Error(`Model "${modelId}" is not available locally and cannot be downloaded.`);
+    return instance;
   }
 
   private async runCompletion(
@@ -228,6 +155,85 @@ class AIService {
     return result.response;
   }
 
+  private fallbackParseTextToFacts(text: string, topic: string): Fact[] {
+    const normalizedText = text.replace(/\r\n/g, '\n');
+    const sentences: string[] = [];
+
+    const lines = normalizedText.split('\n');
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (line.length === 0) {
+        continue;
+      }
+
+      // Split sentences while preserving punctuation.
+      const matches = line.match(/[^.!?]+[.!?]?/g);
+      if (matches) {
+        for (const fragment of matches) {
+          const cleaned = fragment.replace(/^[*-]\s*/, '').replace(/\s+/g, ' ').trim();
+          if (cleaned.length > 0) {
+            sentences.push(cleaned);
+          }
+        }
+      } else {
+        sentences.push(line.replace(/\s+/g, ' '));
+      }
+    }
+
+    const uniqueFacts = new Set<string>();
+    const facts: Fact[] = [];
+    const timestamp = new Date().toISOString();
+
+    for (const sentence of sentences) {
+      const trimmed = sentence.trim();
+      if (trimmed.length === 0) {
+        continue;
+      }
+
+      const normalized = trimmed.toLowerCase();
+      if (uniqueFacts.has(normalized)) {
+        continue;
+      }
+
+      uniqueFacts.add(normalized);
+      const bounded = trimmed.length > 200 ? trimmed.slice(0, 200).trimEnd() : trimmed;
+      if (bounded.length === 0) {
+        continue;
+      }
+
+      facts.push({
+        id: 0,
+        content: bounded,
+        topic,
+        source: 'default',
+        created_at: timestamp,
+      });
+
+      if (facts.length >= 120) {
+        break;
+      }
+    }
+
+    const totalChunks = 1;
+    this.emitProgress({ type: 'parse-start', topic, totalChunks });
+    this.emitProgress({ type: 'parse-chunk-start', topic, chunkIndex: 1, totalChunks });
+    this.emitProgress({
+      type: 'parse-chunk-complete',
+      topic,
+      chunkIndex: 1,
+      totalChunks,
+      factsGenerated: facts.length,
+    });
+    this.emitProgress({
+      type: 'parse-complete',
+      topic,
+      totalChunks,
+      factsGenerated: facts.length,
+    });
+
+    return facts;
+  }
+
   async initialize(): Promise<void> {
     if (this.initialized) {
       return;
@@ -254,43 +260,41 @@ class AIService {
           '[AIService] cactus-react-native is not installed or failed to load. ' +
             'AI features are disabled for now. See CACTUS_INSTALL.md for setup.',
         );
+        this.fallbackEnabled = true;
         this.initialized = true;
         this.initializing = false;
         return;
       }
 
       const config = getModelConfig();
-      const candidates = this.getCandidateModels(config);
-      let lastError: unknown;
 
-      for (const modelId of candidates) {
-        try {
-          const lmInstance = await this.prepareModelInstance(
-            modelId,
-            config,
-            modelId === config.modelId,
-          );
+      try {
+        const lmInstance = await this.prepareModelInstance(config);
+
+        if (typeof lmInstance.init === 'function') {
           await lmInstance.init();
-
-          this.lm = lmInstance;
-          this.currentModelId = modelId;
-          this.initialized = true;
-          this.initializing = false;
-          return;
-        } catch (error) {
-          lastError = error;
-          console.error(`[AIService] Failed to initialize model "${modelId}":`, error);
         }
+
+        this.lm = lmInstance;
+        this.initialized = true;
+        this.initializing = false;
+        return;
+      } catch (error) {
+        console.error('[AIService] Failed to initialize Cactus model:', error);
       }
 
+      console.warn(
+        '[AIService] Falling back to heuristic processing because Cactus model initialization failed.',
+      );
+      this.lm = null;
+      this.fallbackEnabled = true;
       this.initializing = false;
-      this.initialized = false;
-      throw lastError instanceof Error
-        ? lastError
-        : new Error('Failed to initialize Cactus model');
+      this.initialized = true;
+      return;
     } catch (error) {
       this.initializing = false;
       console.error('Failed to initialize AI service:', error);
+      this.fallbackEnabled = true;
       throw error;
     }
   }
@@ -307,8 +311,8 @@ class AIService {
   async parseTextToFacts(text: string, topic: string): Promise<Fact[]> {
     await this.ensureInitialized();
 
-    if (!this.lm) {
-      throw new Error('Model not initialized');
+    if (this.fallbackEnabled || !this.lm) {
+      return this.fallbackParseTextToFacts(text, topic);
     }
 
     try {
@@ -407,17 +411,34 @@ Facts:`;
   async analyzeUserPreference(interactions: Interaction[]): Promise<PreferenceAnalysis> {
     await this.ensureInitialized();
 
-    if (!this.lm) {
-      throw new Error('Model not initialized');
+    const baselineAnalysis = (): PreferenceAnalysis => {
+      if (interactions.length === 0) {
+        return {
+          preferred_topics: [],
+          disliked_topics: [],
+          neutral_topics: [],
+          overall_scores: {},
+        };
+      }
+
+      const rightSwipes = interactions.filter((i) => i.direction === 'right').length;
+      const leftSwipes = interactions.filter((i) => i.direction === 'left').length;
+      const preferenceRatio = rightSwipes / (rightSwipes + leftSwipes || 1);
+
+      return {
+        preferred_topics: preferenceRatio > 0.6 ? ['general'] : [],
+        disliked_topics: preferenceRatio < 0.4 ? ['general'] : [],
+        neutral_topics: [],
+        overall_scores: { general: Number(((preferenceRatio - 0.5) * 2).toFixed(2)) },
+      };
+    };
+
+    if (this.fallbackEnabled || !this.lm) {
+      return baselineAnalysis();
     }
 
     if (interactions.length === 0) {
-      return {
-        preferred_topics: [],
-        disliked_topics: [],
-        neutral_topics: [],
-        overall_scores: {},
-      };
+      return baselineAnalysis();
     }
 
     try {
@@ -471,16 +492,10 @@ Only respond with valid JSON.`;
       }
 
       // Fallback: simple analysis based on ratios
-      const preferenceRatio = rightSwipes / (rightSwipes + leftSwipes || 1);
-      return {
-        preferred_topics: preferenceRatio > 0.6 ? ['general'] : [],
-        disliked_topics: preferenceRatio < 0.4 ? ['general'] : [],
-        neutral_topics: [],
-        overall_scores: { general: (preferenceRatio - 0.5) * 2 }, // Scale to -1 to 1
-      };
+      return baselineAnalysis();
     } catch (error) {
       console.error('Error analyzing user preference:', error);
-      throw error;
+      return baselineAnalysis();
     }
   }
 
@@ -490,8 +505,8 @@ Only respond with valid JSON.`;
   async generateRelatedFacts(topic: string, currentFact: string): Promise<string[]> {
     await this.ensureInitialized();
 
-    if (!this.lm) {
-      throw new Error('Model not initialized');
+    if (this.fallbackEnabled || !this.lm) {
+      return [];
     }
 
     try {
@@ -589,7 +604,7 @@ Related facts:`;
   async generateQuizQuestions(topic: string, factContents: string[]): Promise<QuizQuestion[]> {
     await this.ensureInitialized();
 
-    if (!this.lm || factContents.length === 0) {
+    if (this.fallbackEnabled || !this.lm || factContents.length === 0) {
       return [];
     }
 
@@ -658,7 +673,6 @@ Rules:
       }
       this.lm = null;
       this.initialized = false;
-      this.currentModelId = null;
     }
   }
 }

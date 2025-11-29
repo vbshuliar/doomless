@@ -4,7 +4,6 @@ import { aiService, type AIProgressEvent } from '../services/AIService';
 export interface AIProcessingStatus {
   stage: 'idle' | 'model-download' | 'parsing' | 'quiz' | 'saving' | 'complete' | 'error';
   topic?: string;
-  modelId?: string;
   modelDownloadProgress?: number;
   currentChunk?: number;
   totalChunks?: number;
@@ -47,9 +46,8 @@ export function useAIService(): UseAIServiceReturn {
           return {
             ...base,
             stage: 'model-download',
-            modelId: event.modelId,
             modelDownloadProgress: event.progress,
-            message: `Downloading model ${event.modelId} (${Math.round(event.progress * 100)}%)`,
+            message: `Downloading language model (${Math.round(event.progress * 100)}%)`,
             eventId: timestamp,
           };
         }
@@ -183,7 +181,7 @@ export function useAIService(): UseAIServiceReturn {
     const logEntry = (() => {
       switch (event.type) {
         case 'model-download':
-          return `Model download ${event.modelId}: ${Math.round(event.progress * 100)}%`;
+          return `Model download: ${Math.round(event.progress * 100)}%`;
         case 'parse-start':
           return `Started parsing ${event.topic}.txt`;
         case 'parse-chunk-start':

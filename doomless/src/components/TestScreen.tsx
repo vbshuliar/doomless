@@ -148,7 +148,7 @@ export function TestScreen() {
         <Text style={styles.title}>AI initialization failed</Text>
         <Text style={styles.subtitle}>{aiError.message}</Text>
         <Text style={styles.subtitleSmall}>
-          Check that `model.gguf` is in `android/app/src/main/assets/models/` and Cactus is installed.
+          Make sure `cactus-react-native` is installed and the Cactus model download completes on device.
         </Text>
       </View>
     );

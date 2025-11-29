@@ -2,10 +2,9 @@
 
 This app ships with a Hugging Face model in GGUF format so the Cactus runtime can operate entirely offline.
 
-## Recommended Model
+## Bundled Model
 
-- **Qwen 3.0 0.5B Instruct – Q4_K_M quantization** (~1.1 GB)
-- The project is configured to look for a bundled asset named `qwen3-0_5b-instruct-q4_k_m.gguf`.
+- The current build expects an on-device GGUF file named `model.gguf`.
 
 ## Model Format
 
@@ -22,14 +21,14 @@ Download the GGUF artifact from Hugging Face (for example `qwen3-0_5b-instruct-q
 #### Android
 Place the model file in:
 ```
-android/app/src/main/assets/models/qwen3-0_5b-instruct-q4_k_m.gguf
+android/app/src/main/assets/models/model.gguf
 ```
 
 #### iOS
 1. Open the Xcode project
 2. Drag the GGUF file into the project (select “Create folder references”)
 3. Ensure it's added to the app target
-4. The bundled filename should remain `qwen3-0_5b-instruct-q4_k_m.gguf`
+4. The bundled filename should remain `model.gguf`
 
 ### 3. Verify Model Path
 

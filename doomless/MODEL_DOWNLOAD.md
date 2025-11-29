@@ -2,13 +2,9 @@
 
 ## Quick Download Links
 
-### Qwen 3.0 0.5B Instruct (Recommended - ~1.1GB)
+### Custom Bundled Model
 
-**Direct download from Hugging Face:**
-- **Q4_K_M quantization (balanced):**
-  - https://huggingface.co/Qwen/Qwen3-0.5B-Instruct-GGUF/resolve/main/qwen3-0.5b-instruct-q4_k_m.gguf
-
-> Tip: mirror the file locally if you need a stable internal host. The app expects the filename `qwen3-0_5b-instruct-q4_k_m.gguf`; rename the downloaded file if necessary.
+Bundle the GGUF file you want to ship as `model.gguf`. Ensure it includes all tokenizer/config assets required by the runtime.
 
 ## Installation Steps
 
@@ -18,13 +14,13 @@ Download the GGUF file linked above. The Q4_K_M build offers a solid balance of 
 
 ### 2. Rename the File
 
-Rename the downloaded file to `qwen3-0_5b-instruct-q4_k_m.gguf` (matching the configuration in `modelLoader.ts`).
+Rename the downloaded/converted file to `model.gguf` (matching the configuration in `modelLoader.ts`).
 
 ### 3. Place in Android Assets
 
-Copy the GGUF file to:
+Copy the GGUF file (plus any supporting files) to:
 ```
-android/app/src/main/assets/models/qwen3-0_5b-instruct-q4_k_m.gguf
+android/app/src/main/assets/models/model.gguf
 ```
 
 **Windows PowerShell:**
@@ -33,7 +29,7 @@ android/app/src/main/assets/models/qwen3-0_5b-instruct-q4_k_m.gguf
 New-Item -ItemType Directory -Force -Path "android\app\src\main\assets\models"
 
 # Copy the model file (adjust path to where you downloaded it)
-Copy-Item "C:\path\to\downloaded\qwen3-0_5b-instruct-q4_k_m.gguf" -Destination "android\app\src\main\assets\models\qwen3-0_5b-instruct-q4_k_m.gguf"
+Copy-Item "C:\path\to\model.gguf" -Destination "android\app\src\main\assets\models\model.gguf"
 ```
 
 **Linux/Mac:**
@@ -42,14 +38,14 @@ Copy-Item "C:\path\to\downloaded\qwen3-0_5b-instruct-q4_k_m.gguf" -Destination "
 mkdir -p android/app/src/main/assets/models
 
 # Copy the model file
-cp ~/Downloads/qwen3-0_5b-instruct-q4_k_m.gguf android/app/src/main/assets/models/qwen3-0_5b-instruct-q4_k_m.gguf
+cp ~/Downloads/model.gguf android/app/src/main/assets/models/model.gguf
 ```
 
 ### 4. Verify
 
 Make sure the file exists at:
 ```
-android/app/src/main/assets/models/qwen3-0_5b-instruct-q4_k_m.gguf
+android/app/src/main/assets/models/model.gguf
 ```
 
 ### 5. Rebuild the App
@@ -70,7 +66,7 @@ npm run android
 If the model doesn't load:
 1. Verify the file is in the correct location
 2. Check the file size matches the download
-3. Ensure the file is named exactly `qwen3-0_5b-instruct-q4_k_m.gguf`
+3. Ensure the file is named exactly `model.gguf`
 4. Check app logs for error messages
 5. Make sure you have enough storage space on the device
 
