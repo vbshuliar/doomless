@@ -23,6 +23,7 @@ import {
 } from '../store/brainStore';
 import { CategoryKind, MAX_ENABLED_CATEGORIES } from '../types/categories';
 import { detectSourceType, sortCategoriesForDisplay } from '../utils/categoryUtils';
+import { documentIngestionService } from '../services/DocumentIngestionService';
 
 export const SettingsScreen: React.FC = () => {
   const resetAll = useBrainStore((state: BrainState) => state.resetAll);
@@ -36,6 +37,7 @@ export const SettingsScreen: React.FC = () => {
 
   const [renameTargetId, setRenameTargetId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [isImporting, setIsImporting] = useState(false);
 
   const enabledCount = useMemo(
     () => categories.filter((category) => category.enabled).length,
@@ -88,7 +90,12 @@ export const SettingsScreen: React.FC = () => {
   };
 
   const handleImportSource = async () => {
+    let createdCategoryId: string | null = null;
     try {
+      if (isImporting) {
+        return;
+      }
+      setIsImporting(true);
       // Once the LLM/RAG pipeline lands, this picker response will seed ingestion for embeddings.
       const files = await pick({
         presentationStyle: 'fullScreen',
@@ -115,15 +122,51 @@ export const SettingsScreen: React.FC = () => {
         createdAt: Date.now(),
       });
 
+      if (!result.success) {
+        Alert.alert('Import failed', 'We could not register that source. Please try again.');
+        return;
+      }
+
       if (!result.enabled && result.reason) {
         Alert.alert('Category added', `${name} was added but left disabled.\n${result.reason}`);
       }
+
+      if (!result.categoryId) {
+        throw new Error('Unable to register the new category for ingestion.');
+      }
+
+      createdCategoryId = result.categoryId;
+
+      const { factCount } = await documentIngestionService.ingest({
+        categoryId: result.categoryId,
+        categoryName: name,
+        fileUri: uri,
+        fileName: name,
+        mimeType: file.type,
+      });
+
+      if (factCount === 0) {
+        deleteCategory(result.categoryId);
+        createdCategoryId = null;
+        Alert.alert(
+          'No facts extracted',
+          'We could not extract any facts from that file. The category has been removed.',
+        );
+        return;
+      }
+
+      Alert.alert('Import complete', `Added ${factCount} new facts from “${name}”.`);
     } catch (error) {
       if (isErrorWithCode(error) && error.code === errorCodes.OPERATION_CANCELED) {
         return;
       }
       console.warn('Failed to import file', error);
       Alert.alert('Import failed', 'Something went wrong while importing the file.');
+      if (createdCategoryId) {
+        deleteCategory(createdCategoryId);
+      }
+    } finally {
+      setIsImporting(false);
     }
   };
 
@@ -153,16 +196,23 @@ export const SettingsScreen: React.FC = () => {
         style={styles.scroll}
         contentContainerStyle={styles.container}
         showsVerticalScrollIndicator={false}
+        nestedScrollEnabled
       >
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Sources &amp; Categories</Text>
-          <TouchableOpacity style={styles.importCard} onPress={handleImportSource}>
+          <TouchableOpacity
+            style={[styles.importCard, isImporting && styles.importCardDisabled]}
+            onPress={handleImportSource}
+            disabled={isImporting}
+          >
             <View style={styles.importIconBadge}>
               <Text style={styles.importIconText}>＋</Text>
             </View>
             <View style={styles.importCopy}>
               <Text style={styles.importTitle}>Import source file</Text>
-              <Text style={styles.importSubtitle}>PDF, TXT, or Word document</Text>
+              <Text style={styles.importSubtitle}>
+                {isImporting ? 'Processing with your offline model…' : 'PDF, TXT, or Word document'}
+              </Text>
             </View>
           </TouchableOpacity>
 
@@ -170,6 +220,7 @@ export const SettingsScreen: React.FC = () => {
             <ScrollView
               contentContainerStyle={styles.categoryListContent}
               showsVerticalScrollIndicator={false}
+              nestedScrollEnabled
             >
               {sortedCategories.map((category) => {
                 const isImported = category.kind === CategoryKind.Imported;
@@ -329,6 +380,9 @@ const styles = StyleSheet.create({
     borderRadius: 20,
     paddingVertical: 16,
     paddingHorizontal: 20,
+  },
+  importCardDisabled: {
+    opacity: 0.6,
   },
   importIconBadge: {
     width: 40,

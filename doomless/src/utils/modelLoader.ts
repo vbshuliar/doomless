@@ -23,9 +23,10 @@ export interface ModelConfig {
 
 export function getModelConfig(): ModelConfig {
   return {
-    modelId: 'qwen3-0.6',
-    contextSize: 2048,
-    useBundledAsset: false,
+    modelId: 'qwen3-0_5b-instruct-q4_k_m',
+    contextSize: 4096,
+    useBundledAsset: true,
+    assetFileName: 'qwen3-0_5b-instruct-q4_k_m.gguf',
   };
 }
 

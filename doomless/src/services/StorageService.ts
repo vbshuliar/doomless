@@ -1,11 +1,54 @@
-import SQLite from 'react-native-sqlite-2';
 import { Fact, FactInput } from '../types/Fact';
 import { Interaction, InteractionInput } from '../types/Interaction';
 import { UserPreference } from '../types/Preferences';
 import { UserDocument, UserDocumentInput } from '../types/UserDocument';
 
+type SQLResultSet = {
+  rows: {
+    length: number;
+    item: (index: number) => any;
+  };
+  insertId: number;
+};
+
+type SQLTransaction = {
+  executeSql: (
+    sqlStatement: string,
+    args: any[],
+    successCallback?: (transaction: SQLTransaction, resultSet: SQLResultSet) => void,
+    errorCallback?: (transaction: SQLTransaction, error: Error) => boolean,
+  ) => void;
+};
+
+type SQLiteDatabase = {
+  transaction: (
+    scope: (transaction: SQLTransaction) => void,
+    errorCallback?: (error: unknown) => void,
+    successCallback?: () => void,
+  ) => void;
+  close: () => Promise<void> | void;
+};
+
+type SQLiteModule = {
+  openDatabase: (config: { name: string; location: string }) => SQLiteDatabase;
+};
+
+const rawSQLite = require('react-native-sqlite-2');
+const resolvedSQLite =
+  rawSQLite && typeof rawSQLite.openDatabase === 'function'
+    ? rawSQLite
+    : rawSQLite?.default && typeof rawSQLite.default.openDatabase === 'function'
+    ? rawSQLite.default
+    : null;
+
+if (!resolvedSQLite) {
+  throw new Error('react-native-sqlite-2 failed to provide openDatabase');
+}
+
+const SQLite: SQLiteModule = resolvedSQLite;
+
 class StorageService {
-  private db: SQLite.SQLiteDatabase | null = null;
+  private db: SQLiteDatabase | null = null;
   private initialized = false;
 
   async initialize(): Promise<void> {
@@ -14,7 +57,7 @@ class StorageService {
     }
 
     try {
-      this.db = await SQLite.openDatabase({
+      this.db = SQLite.openDatabase({
         name: 'doomless.db',
         location: 'default',
       });
@@ -47,7 +90,7 @@ class StorageService {
           )`,
           [],
           () => {},
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error creating facts table:', error);
             return false;
           }
@@ -64,7 +107,7 @@ class StorageService {
           )`,
           [],
           () => {},
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error creating user_interactions table:', error);
             return false;
           }
@@ -80,7 +123,7 @@ class StorageService {
           )`,
           [],
           () => {},
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error creating user_preferences table:', error);
             return false;
           }
@@ -98,7 +141,7 @@ class StorageService {
           )`,
           [],
           () => {},
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error creating user_documents table:', error);
             return false;
           }
@@ -125,10 +168,10 @@ class StorageService {
             fact.is_quiz ? 1 : 0,
             fact.quiz_data ? JSON.stringify(fact.quiz_data) : null,
           ],
-          (_, result) => {
+          (_tx: SQLTransaction, result: SQLResultSet) => {
             resolve(result.insertId);
           },
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error inserting fact:', error);
             reject(error);
             return false;
@@ -168,7 +211,7 @@ class StorageService {
         tx.executeSql(
           query,
           params,
-          (_, result) => {
+          (_tx: SQLTransaction, result: SQLResultSet) => {
             const facts: Fact[] = [];
             for (let i = 0; i < result.rows.length; i++) {
               const row = result.rows.item(i);
@@ -184,11 +227,105 @@ class StorageService {
             }
             resolve(facts);
           },
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error getting facts:', error);
             reject(error);
             return false;
           }
+        );
+      }, reject);
+    });
+  }
+
+  async getFactCountByTopic(
+    topic: string,
+    options: { includeQuizzes?: boolean } = {},
+  ): Promise<number> {
+    if (!this.db) {
+      await this.initialize();
+    }
+
+    return new Promise((resolve, reject) => {
+      let query = 'SELECT COUNT(*) as count FROM facts WHERE topic = ?';
+      const params: any[] = [topic];
+
+      if (options.includeQuizzes === false) {
+        query += ' AND (is_quiz IS NULL OR is_quiz = 0)';
+      }
+
+      this.db!.transaction((tx) => {
+        tx.executeSql(
+          query,
+          params,
+          (_tx: SQLTransaction, result: SQLResultSet) => {
+            const count = result.rows.length > 0 ? Number(result.rows.item(0).count) : 0;
+            resolve(Number.isFinite(count) ? count : 0);
+          },
+          (_tx: SQLTransaction, error: Error) => {
+            console.error('Error counting facts by topic:', error);
+            reject(error);
+            return false;
+          },
+        );
+      }, reject);
+    });
+  }
+
+  async getFactsByTopics(
+    topics: string[],
+    options: { includeQuizzes?: boolean; quizOnly?: boolean; limit?: number } = {},
+  ): Promise<Fact[]> {
+    if (!this.db) {
+      await this.initialize();
+    }
+
+    if (topics.length === 0) {
+      return [];
+    }
+
+    return new Promise((resolve, reject) => {
+      const placeholders = topics.map(() => '?').join(',');
+      let query = `SELECT * FROM facts WHERE topic IN (${placeholders})`;
+      const params: any[] = [...topics];
+
+      if (options.quizOnly) {
+        query += ' AND is_quiz = 1';
+      } else if (options.includeQuizzes === false) {
+        query += ' AND (is_quiz IS NULL OR is_quiz = 0)';
+      }
+
+      query += ' ORDER BY created_at DESC';
+
+      if (options.limit) {
+        query += ' LIMIT ?';
+        params.push(options.limit);
+      }
+
+      this.db!.transaction((tx) => {
+        tx.executeSql(
+          query,
+          params,
+          (_tx: SQLTransaction, result: SQLResultSet) => {
+            const facts: Fact[] = [];
+            for (let i = 0; i < result.rows.length; i++) {
+              const row = result.rows.item(i);
+              facts.push({
+                id: row.id,
+                content: row.content,
+                topic: row.topic,
+                source: row.source,
+                created_at: row.created_at,
+                is_quiz: row.is_quiz === 1,
+                quiz_data: row.quiz_data ? JSON.parse(row.quiz_data) : undefined,
+              });
+            }
+            resolve(facts);
+          },
+          (_tx: SQLTransaction, error: Error) => {
+            console.error('Error getting facts by topics:', error);
+            reject(error);
+            return false;
+          },
         );
       }, reject);
     });
@@ -204,7 +341,7 @@ class StorageService {
         tx.executeSql(
           'SELECT * FROM facts WHERE id = ?',
           [id],
-          (_, result) => {
+          (_tx: SQLTransaction, result: SQLResultSet) => {
             if (result.rows.length > 0) {
               const row = result.rows.item(0);
               resolve({
@@ -220,7 +357,7 @@ class StorageService {
               resolve(null);
             }
           },
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error getting fact by id:', error);
             reject(error);
             return false;
@@ -241,10 +378,10 @@ class StorageService {
         tx.executeSql(
           'INSERT INTO user_interactions (fact_id, direction) VALUES (?, ?)',
           [interaction.fact_id, interaction.direction],
-          (_, result) => {
+          (_tx: SQLTransaction, result: SQLResultSet) => {
             resolve(result.insertId);
           },
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error inserting interaction:', error);
             reject(error);
             return false;
@@ -272,7 +409,7 @@ class StorageService {
         tx.executeSql(
           query,
           params,
-          (_, result) => {
+          (_tx: SQLTransaction, result: SQLResultSet) => {
             const interactions: Interaction[] = [];
             for (let i = 0; i < result.rows.length; i++) {
               const row = result.rows.item(i);
@@ -285,7 +422,7 @@ class StorageService {
             }
             resolve(interactions);
           },
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error getting interactions:', error);
             reject(error);
             return false;
@@ -305,7 +442,7 @@ class StorageService {
         tx.executeSql(
           'SELECT * FROM user_interactions WHERE fact_id = ? ORDER BY timestamp DESC',
           [factId],
-          (_, result) => {
+          (_tx: SQLTransaction, result: SQLResultSet) => {
             const interactions: Interaction[] = [];
             for (let i = 0; i < result.rows.length; i++) {
               const row = result.rows.item(i);
@@ -318,7 +455,7 @@ class StorageService {
             }
             resolve(interactions);
           },
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error getting interactions by fact id:', error);
             reject(error);
             return false;
@@ -340,7 +477,7 @@ class StorageService {
         tx.executeSql(
           'SELECT * FROM user_preferences WHERE topic = ?',
           [topic],
-          (_, result) => {
+          (_tx: SQLTransaction, result: SQLResultSet) => {
             if (result.rows.length > 0) {
               const currentScore = result.rows.item(0).preference_score;
               const newScore = Math.max(-1.0, Math.min(1.0, currentScore + scoreDelta));
@@ -349,7 +486,7 @@ class StorageService {
                 'UPDATE user_preferences SET preference_score = ?, last_updated = datetime("now") WHERE topic = ?',
                 [newScore, topic],
                 () => resolve(),
-                (_, error) => {
+                (_tx: SQLTransaction, error: Error) => {
                   console.error('Error updating preference:', error);
                   reject(error);
                   return false;
@@ -362,7 +499,7 @@ class StorageService {
                 'INSERT INTO user_preferences (topic, preference_score) VALUES (?, ?)',
                 [topic, newScore],
                 () => resolve(),
-                (_, error) => {
+                (_tx: SQLTransaction, error: Error) => {
                   console.error('Error inserting preference:', error);
                   reject(error);
                   return false;
@@ -370,7 +507,7 @@ class StorageService {
               );
             }
           },
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error getting preference:', error);
             reject(error);
             return false;
@@ -390,7 +527,7 @@ class StorageService {
         tx.executeSql(
           'SELECT * FROM user_preferences ORDER BY preference_score DESC',
           [],
-          (_, result) => {
+          (_tx: SQLTransaction, result: SQLResultSet) => {
             const preferences: UserPreference[] = [];
             for (let i = 0; i < result.rows.length; i++) {
               const row = result.rows.item(i);
@@ -403,7 +540,7 @@ class StorageService {
             }
             resolve(preferences);
           },
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error getting preferences:', error);
             reject(error);
             return false;
@@ -423,7 +560,7 @@ class StorageService {
         tx.executeSql(
           'SELECT * FROM user_preferences WHERE topic = ?',
           [topic],
-          (_, result) => {
+          (_tx: SQLTransaction, result: SQLResultSet) => {
             if (result.rows.length > 0) {
               const row = result.rows.item(0);
               resolve({
@@ -436,7 +573,7 @@ class StorageService {
               resolve(null);
             }
           },
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error getting preference by topic:', error);
             reject(error);
             return false;
@@ -457,10 +594,10 @@ class StorageService {
         tx.executeSql(
           'INSERT INTO user_documents (filename, file_path, topic) VALUES (?, ?, ?)',
           [document.filename, document.file_path, document.topic || null],
-          (_, result) => {
+          (_tx: SQLTransaction, result: SQLResultSet) => {
             resolve(result.insertId);
           },
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error inserting document:', error);
             reject(error);
             return false;
@@ -481,7 +618,7 @@ class StorageService {
           'UPDATE user_documents SET processed = ? WHERE id = ?',
           [processed ? 1 : 0, id],
           () => resolve(),
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error updating document processed status:', error);
             reject(error);
             return false;
@@ -501,7 +638,7 @@ class StorageService {
         tx.executeSql(
           'SELECT * FROM user_documents ORDER BY created_at DESC',
           [],
-          (_, result) => {
+          (_tx: SQLTransaction, result: SQLResultSet) => {
             const documents: UserDocument[] = [];
             for (let i = 0; i < result.rows.length; i++) {
               const row = result.rows.item(i);
@@ -516,7 +653,7 @@ class StorageService {
             }
             resolve(documents);
           },
-          (_, error) => {
+          (_tx: SQLTransaction, error: Error) => {
             console.error('Error getting documents:', error);
             reject(error);
             return false;

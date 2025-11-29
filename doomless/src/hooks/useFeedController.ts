@@ -1,12 +1,14 @@
 // Centralized feed logic: surfaces the next card to show and wires up store updates.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { factCards, quizCards } from '../data/cardsData';
 import type { QuizFeedback } from '../components/QuizCard';
 import type { Card, FactCard, QuizCard } from '../types/cards';
 import type { CategoryId } from '../types/categories';
 import { useBrainStore } from '../store/brainStore';
 import type { BrainState } from '../store/brainStore';
+import type { Fact } from '../types/Fact';
+import { defaultContentSeeder } from '../services/DefaultContentSeeder';
+import { storageService } from '../services/StorageService';
 
 const QUIZ_INTERVAL = 3;
 
@@ -25,6 +27,40 @@ type UseFeedControllerReturn = {
 type WeightedItem<T extends { category: FactCard['category'] }> = {
   item: T;
   weight: number;
+};
+
+const inferDifficulty = (text: string): FactCard['difficulty'] => {
+  const length = text.length;
+  if (length < 100) {
+    return 'easy';
+  }
+  if (length < 160) {
+    return 'medium';
+  }
+  return 'hard';
+};
+
+const mapFactToFactCard = (fact: Fact): FactCard => ({
+  id: `fact-${fact.id}`,
+  type: 'fact',
+  text: fact.content,
+  category: fact.topic as CategoryId,
+  difficulty: inferDifficulty(fact.content),
+});
+
+const mapFactToQuizCard = (fact: Fact): QuizCard | null => {
+  if (!fact.quiz_data) {
+    return null;
+  }
+  return {
+    id: `quiz-${fact.id}`,
+    type: 'quiz',
+    question: fact.quiz_data.question,
+    options: fact.quiz_data.options,
+    correctIndex: fact.quiz_data.correct_answer,
+    category: fact.topic as CategoryId,
+    relatedFactId: `fact-${fact.id}`,
+  };
 };
 
 const buildWeightedPool = <T extends { category: FactCard['category'] }>(
@@ -58,6 +94,7 @@ export const useFeedController = (): UseFeedControllerReturn => {
   const seenCardIds = useBrainStore((state: BrainState) => state.seenCardIds);
   const hasHydrated = useBrainStore((state: BrainState) => state.hasHydrated);
   const categories = useBrainStore((state: BrainState) => state.categories);
+  const contentRevision = useBrainStore((state: BrainState) => state.contentRevision);
   const recordFactInteraction = useBrainStore(
     (state: BrainState) => state.recordFactInteraction,
   );
@@ -72,10 +109,21 @@ export const useFeedController = (): UseFeedControllerReturn => {
 
   const [currentCard, setCurrentCard] = useState<Card | null>(null);
   const [quizFeedback, setQuizFeedback] = useState<QuizFeedback | null>(null);
+  const [factDeck, setFactDeck] = useState<FactCard[]>([]);
+  const [quizDeck, setQuizDeck] = useState<QuizCard[]>([]);
+  const [isDeckLoading, setIsDeckLoading] = useState(true);
 
-  const enabledCategoryIds = useMemo(
-    () => new Set(categories.filter((category) => category.enabled).map((category) => category.id)),
+  const enabledCategoryList = useMemo(
+    () => categories.filter((category) => category.enabled).map((category) => category.id),
     [categories],
+  );
+  const enabledCategorySignature = useMemo(
+    () => enabledCategoryList.join('|'),
+    [enabledCategoryList],
+  );
+  const enabledCategoryIds = useMemo(
+    () => new Set(enabledCategoryList),
+    [enabledCategoryList],
   );
 
   useEffect(() => {
@@ -88,7 +136,7 @@ export const useFeedController = (): UseFeedControllerReturn => {
   }, []);
 
   const pickFactCard = useCallback((): FactCard | null => {
-    const source = factCards.filter((card) => enabledCategoryIds.has(card.category));
+    const source = factDeck.filter((card) => enabledCategoryIds.has(card.category));
     if (source.length === 0) {
       return null;
     }
@@ -96,28 +144,28 @@ export const useFeedController = (): UseFeedControllerReturn => {
     const pool = unseen.length > 0 ? unseen : source;
     const weightedPool = buildWeightedPool(pool, profile.categoryScores);
     return pickByWeight(weightedPool);
-  }, [enabledCategoryIds, profile.categoryScores, seenCardIds]);
+  }, [enabledCategoryIds, factDeck, profile.categoryScores, seenCardIds]);
 
   const pickQuizCard = useCallback((): QuizCard | null => {
-    const source = quizCards.filter((card) => enabledCategoryIds.has(card.category));
+    const source = quizDeck.filter((card) => enabledCategoryIds.has(card.category));
     if (source.length === 0) {
       return null;
     }
     const unseen = source.filter((card) => !seenCardIds.includes(card.id));
     const pool = unseen.length > 0 ? unseen : source;
     return pickByWeight(buildWeightedPool(pool, profile.categoryScores));
-  }, [enabledCategoryIds, profile.categoryScores, seenCardIds]);
+  }, [enabledCategoryIds, profile.categoryScores, quizDeck, seenCardIds]);
 
   const advanceToNextCard = useCallback(
     (forceQuiz = false) => {
-      if (!hasHydrated) {
+      if (!hasHydrated || isDeckLoading) {
         return;
       }
       setQuizFeedback(null);
 
       const shouldShowQuiz =
         forceQuiz ||
-        (factsSinceQuiz.current >= QUIZ_INTERVAL && quizCards.length > 0);
+        (factsSinceQuiz.current >= QUIZ_INTERVAL && quizDeck.length > 0);
 
       let nextCard: Card | null = null;
       if (shouldShowQuiz) {
@@ -149,14 +197,79 @@ export const useFeedController = (): UseFeedControllerReturn => {
         setCurrentCard(null);
       }
     },
-    [addSeenCard, hasHydrated, pickFactCard, pickQuizCard],
+    [addSeenCard, hasHydrated, isDeckLoading, pickFactCard, pickQuizCard, quizDeck.length],
   );
 
   useEffect(() => {
-    if (hasHydrated && currentCard === null) {
+    if (!hasHydrated || isDeckLoading) {
+      return;
+    }
+    if (currentCard === null) {
       advanceToNextCard();
     }
-  }, [advanceToNextCard, currentCard, hasHydrated]);
+  }, [advanceToNextCard, currentCard, hasHydrated, isDeckLoading]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadDeck = async () => {
+      setIsDeckLoading(true);
+      try {
+        await defaultContentSeeder.ensureSeeded();
+        await storageService.initialize();
+
+        if (enabledCategoryList.length === 0) {
+          if (!cancelled) {
+            setFactDeck([]);
+            setQuizDeck([]);
+            factsSinceQuiz.current = 0;
+            setCurrentCard(null);
+          }
+          return;
+        }
+
+        const facts = await storageService.getFactsByTopics(enabledCategoryList, {
+          includeQuizzes: true,
+          limit: 500,
+        });
+
+        if (cancelled) {
+          return;
+        }
+
+        const factCards = facts
+          .filter((fact) => !fact.is_quiz)
+          .map(mapFactToFactCard);
+        const quizCards = facts
+          .filter((fact) => fact.is_quiz && fact.quiz_data)
+          .map(mapFactToQuizCard)
+          .filter((card): card is QuizCard => card != null);
+
+        setFactDeck(factCards);
+        setQuizDeck(quizCards);
+        factsSinceQuiz.current = 0;
+        setCurrentCard(null);
+      } catch (error) {
+        if (!cancelled) {
+          console.error('[Feed] Failed to load deck:', error);
+          setFactDeck([]);
+          setQuizDeck([]);
+          factsSinceQuiz.current = 0;
+          setCurrentCard(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsDeckLoading(false);
+        }
+      }
+    };
+
+    loadDeck();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [contentRevision, enabledCategorySignature]);
 
   const likeCurrent = useCallback(() => {
     if (!currentCard || currentCard.type !== 'fact') {
@@ -230,9 +343,11 @@ export const useFeedController = (): UseFeedControllerReturn => {
     advanceToNextCard();
   }, [advanceToNextCard, currentCard]);
 
+  const isHydrating = !hasHydrated || isDeckLoading;
+
   return {
     currentCard,
-    isHydrating: !hasHydrated,
+    isHydrating,
     quizFeedback,
     likeCurrent,
     dislikeCurrent,

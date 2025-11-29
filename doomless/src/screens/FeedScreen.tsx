@@ -310,7 +310,7 @@ export const FeedScreen: React.FC = () => {
           <Text style={styles.placeholderText}>
             {enabledCategoryCount === 0
               ? 'Enable up to five categories in Settings to start the curiosity stream.'
-              : 'You have explored all bundled cards. New content will arrive with the next update.'}
+              : 'You have explored every available card. Import a file or enable more categories to refresh the feed.'}
           </Text>
         </View>
       </SafeAreaView>

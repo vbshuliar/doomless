@@ -1,11 +1,11 @@
 # Model Setup Instructions
 
-This app requires a Hugging Face model in GGUF format to be bundled with the app for offline AI inference.
+This app ships with a Hugging Face model in GGUF format so the Cactus runtime can operate entirely offline.
 
 ## Recommended Model
 
-- **TinyLlama-1.1B-Chat** (GGUF format, ~700MB)
-- Alternative: **Phi-2** (smaller, but may have different performance characteristics)
+- **Qwen 3.0 0.5B Instruct – Q4_K_M quantization** (~1.1 GB)
+- The project is configured to look for a bundled asset named `qwen3-0_5b-instruct-q4_k_m.gguf`.
 
 ## Model Format
 
@@ -15,27 +15,27 @@ The model must be in **GGUF format** (required by Cactus). If you have a model i
 
 ### 1. Download Model
 
-Download a GGUF model file (e.g., `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` or similar) from Hugging Face.
+Download the GGUF artifact from Hugging Face (for example `qwen3-0_5b-instruct-q4_k_m.gguf`). Keep the filename intact so it matches the value referenced in `src/utils/modelLoader.ts`.
 
 ### 2. Place Model File
 
 #### Android
 Place the model file in:
 ```
-android/app/src/main/assets/models/model.gguf
+android/app/src/main/assets/models/qwen3-0_5b-instruct-q4_k_m.gguf
 ```
 
 #### iOS
 1. Open the Xcode project
-2. Drag the `model.gguf` file into the project
+2. Drag the GGUF file into the project (select “Create folder references”)
 3. Ensure it's added to the app target
-4. The file will be bundled with the app
+4. The bundled filename should remain `qwen3-0_5b-instruct-q4_k_m.gguf`
 
 ### 3. Verify Model Path
 
 The app will automatically:
-- Copy the model from Android assets to a writable location on first run
-- Load the model from the iOS bundle
+- Copy the bundled model into Cactus' writable directory on first run (Android)
+- Load the GGUF file directly from the iOS bundle
 
 ### 4. Model Size Considerations
 
@@ -45,11 +45,7 @@ The app will automatically:
 
 ## Alternative: On-Demand Download
 
-If you prefer to download the model on first launch instead of bundling it:
-
-1. Host the model file on a CDN or file server
-2. Modify `src/utils/modelLoader.ts` to download the model on first launch
-3. Store the downloaded model in the app's documents directory
+The default configuration avoids any network calls. If you must download models dynamically, update `src/utils/modelLoader.ts` to provide a fallback identifier and re-enable remote downloads. Remember to obtain user consent before transferring large files.
 
 ## Testing
 
