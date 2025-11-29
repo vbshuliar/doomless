@@ -1,45 +1,76 @@
-/**
- * Sample React Native App
- * https://github.com/facebook/react-native
- *
- * @format
- */
+import React, { useMemo } from 'react';
+import { StatusBar, Text, useColorScheme } from 'react-native';
+import { NavigationContainer, DarkTheme, DefaultTheme } from '@react-navigation/native';
+import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { enableScreens } from 'react-native-screens';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
 
-import { NewAppScreen } from '@react-native/new-app-screen';
-import { StatusBar, StyleSheet, useColorScheme, View } from 'react-native';
-import {
-  SafeAreaProvider,
-  useSafeAreaInsets,
-} from 'react-native-safe-area-context';
+import { FeedScreen } from './src/screens/FeedScreen';
+import { BrainScreen } from './src/screens/BrainScreen';
+import { SettingsScreen } from './src/screens/SettingsScreen';
 
-function App() {
-  const isDarkMode = useColorScheme() === 'dark';
+enableScreens();
+
+const Tab = createBottomTabNavigator();
+
+const App = () => {
+  const colorScheme = useColorScheme();
+
+  const navigationTheme = useMemo(
+    () => (colorScheme === 'dark' ? DarkTheme : DefaultTheme),
+    [colorScheme],
+  );
+
+  const statusBarStyle = colorScheme === 'dark' ? 'light-content' : 'dark-content';
+
+  const renderTabIcon = (symbol: string) => ({ color }: { color: string }) => (
+    <Text style={{ fontSize: 18, color }}>{symbol}</Text>
+  );
 
   return (
-    <SafeAreaProvider>
-      <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
-      <AppContent />
-    </SafeAreaProvider>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <SafeAreaProvider>
+        <NavigationContainer theme={navigationTheme}>
+          <StatusBar barStyle={statusBarStyle} />
+          <Tab.Navigator
+            screenOptions={{
+              headerShown: false,
+              tabBarStyle: { paddingBottom: 6, height: 60 },
+              tabBarLabelStyle: { fontSize: 12, fontWeight: '600' },
+              tabBarActiveTintColor: '#2563eb',
+              tabBarInactiveTintColor: '#6b7280',
+            }}
+          >
+            <Tab.Screen
+              name="Feed"
+              component={FeedScreen}
+              options={{
+                tabBarLabel: 'Feed',
+                tabBarIcon: renderTabIcon('🧠'),
+              }}
+            />
+            <Tab.Screen
+              name="Brain"
+              component={BrainScreen}
+              options={{
+                tabBarLabel: 'Brain',
+                tabBarIcon: renderTabIcon('📊'),
+              }}
+            />
+            <Tab.Screen
+              name="Settings"
+              component={SettingsScreen}
+              options={{
+                tabBarLabel: 'Settings',
+                tabBarIcon: renderTabIcon('⚙️'),
+              }}
+            />
+          </Tab.Navigator>
+        </NavigationContainer>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
-}
-
-function AppContent() {
-  const safeAreaInsets = useSafeAreaInsets();
-
-  return (
-    <View style={styles.container}>
-      <NewAppScreen
-        templateFileName="App.tsx"
-        safeAreaInsets={safeAreaInsets}
-      />
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-});
+};
 
 export default App;
