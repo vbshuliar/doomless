@@ -1,7 +1,12 @@
 import { Fact } from '../types/Fact';
-import { Interaction } from '../types/Interaction';
-import { PreferenceAnalysis } from '../types/Preferences';
+import type { Interaction } from '../types/Interaction';
+import type { PreferenceAnalysis } from '../types/Preferences';
 import { getModelConfig, type ModelConfig } from '../utils/modelLoader';
+
+// React Native exposes __DEV__ for runtime environment detection.
+declare const __DEV__: boolean | undefined;
+
+// ------------ Progress & internal types ------------
 
 export type AIProgressEvent =
   | { type: 'model-download'; progress: number }
@@ -24,44 +29,71 @@ export type AIProgressEvent =
 
 type ProgressListener = (event: AIProgressEvent) => void;
 
-export type QuizQuestion = {
-  question: string;
-  options: string[];
-  correct_answer: number;
-};
-
-type CompletionMessage = {
+type CactusMessage = {
   role: 'user' | 'assistant' | 'system';
   content: string;
   images?: string[];
 };
 
-function stripThinkingBlocks(raw: string): string {
-  if (!raw) {
-    return raw;
-  }
+type CompletionOptions = {
+  temperature?: number;
+  maxTokens?: number;
+  topP?: number;
+  topK?: number;
+  stopSequences?: string[];
+};
 
+type QuizQuestion = {
+  question: string;
+  options: string[];
+  correct_answer: number;
+};
+
+type StorageServiceInstance = {
+  initialize: () => Promise<void>;
+  getFactById: (id: number) => Promise<Fact | null>;
+};
+
+// ------------ Cactus dynamic import ------------
+
+let CactusLMClass: any = null;
+try {
+  // This will work in React Native; in tests / web it just falls back.
+  CactusLMClass = require('cactus-react-native').CactusLM;
+} catch {
+  console.warn(
+    '[AIService] cactus-react-native not found. AI features will use fallback sentence splitter.',
+  );
+}
+
+// Remove <think> blocks if the local model ever emits them.
+function stripThinkingBlocks(raw: string): string {
+  if (!raw) return raw;
   let cleaned = raw.replace(/<think>[\s\S]*?<\/think>/gi, '');
   cleaned = cleaned.replace(/<think>|<\/think>/gi, '');
-
   return cleaned.trim();
 }
 
-// Cactus React Native bridge imports (gracefully degraded when module is missing)
-let CactusLMClass: any = null;
-try {
-  CactusLMClass = require('cactus-react-native').CactusLM;
-} catch {
-  console.warn('cactus-react-native not found. AI features will not work until installed.');
-}
+// ------------ AIService ------------
 
 class AIService {
   private lm: any = null;
   private initialized = false;
   private initializing = false;
+  private fallbackEnabled = false;
   private lastDownloadPercent: number | null = null;
   private progressListeners = new Set<ProgressListener>();
-  private fallbackEnabled = false;
+  private storageService: StorageServiceInstance | null | undefined;
+
+  /**
+   * Optional: hook to get progress events in your UI
+   */
+  setProgressListener(listener?: ProgressListener) {
+    this.progressListeners.clear();
+    if (listener) {
+      this.progressListeners.add(listener);
+    }
+  }
 
   subscribeProgress(listener: ProgressListener): () => void {
     this.progressListeners.add(listener);
@@ -70,206 +102,89 @@ class AIService {
     };
   }
 
-  emitProgress(event: AIProgressEvent): void {
+  public emitProgress(event: AIProgressEvent) {
+    if (this.progressListeners.size === 0) {
+      return;
+    }
+
     this.progressListeners.forEach((listener) => {
       try {
         listener(event);
       } catch (error) {
-        console.error('[AIService] Progress listener failed:', error);
+        this.debugLog('Progress listener threw an error', error);
       }
     });
   }
 
-  private createModelInstance(
-    contextSize: number,
-  ): any {
+  private debugLog(message: string, extra?: unknown) {
+    if (__DEV__) {
+      console.log('[AIService]', message, extra ?? '');
+    }
+  }
+
+  private preview(text: string, maxLen: number): string {
+    if (text.length <= maxLen) return text;
+    return `${text.slice(0, maxLen)}…`;
+  }
+
+  // ---------- Initialization / model loading ----------
+
+  private async prepareModelInstance(config: ModelConfig): Promise<any> {
     if (!CactusLMClass) {
-      return null;
-    }
-    return new CactusLMClass({
-      contextSize,
-    });
-  }
-
-  private async prepareModelInstance(
-    config: ModelConfig,
-  ): Promise<any> {
-    const contextSize = config.contextSize ?? 2048;
-    const instance = this.createModelInstance(contextSize);
-
-    if (!instance) {
-      throw new Error(
-        'cactus-react-native is not installed. Please install it following the instructions in CACTUS_INSTALL.md.',
-      );
+      throw new Error('cactus-react-native is not available');
     }
 
-    if (config.preloadModel !== false && typeof instance.download === 'function') {
-      this.lastDownloadPercent = null;
-      try {
-        await instance.download({
-          onProgress: (progress: number) => {
-            if (!Number.isFinite(progress)) {
-              return;
-            }
-            const pct = Math.round(progress * 100);
-            if (this.lastDownloadPercent === pct) {
-              return;
-            }
-            this.lastDownloadPercent = pct;
-            if (pct % 5 === 0 || pct === 100) {
-              console.log(`[AIService] Downloading Cactus model… ${pct}%`);
-            }
-            this.emitProgress({ type: 'model-download', progress });
-          },
-        });
-        return instance;
-      } catch (error) {
-        throw new Error(
-          `Failed to download Cactus model: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+    // Use your model config if it has a `model` field; otherwise default.
+    const lmOptions: any = { mode: 'local' }; // force local-only (no hybrid)
+    if ((config as any).model) {
+      lmOptions.model = (config as any).model;
     }
 
-    return instance;
-  }
+    const lmInstance = new CactusLMClass(lmOptions);
 
-  private async runCompletion(
-    messages: CompletionMessage[],
-    options: {
-      temperature?: number;
-      topP?: number;
-      topK?: number;
-      maxTokens?: number;
-      stopSequences?: string[];
-    } = {},
-  ): Promise<string> {
-    if (!this.lm) {
-      throw new Error('Model not initialized');
-    }
-
-    const result = await this.lm.complete({
-      messages,
-      options: {
-        temperature: options.temperature,
-        topP: options.topP,
-        topK: options.topK,
-        maxTokens: options.maxTokens,
-        stopSequences: options.stopSequences,
+    // Download the model (no-op if already downloaded)
+    await lmInstance.download({
+      onProgress: (progress: number) => {
+        const percent = Math.round(progress * 100);
+        if (this.lastDownloadPercent === null || percent !== this.lastDownloadPercent) {
+          this.lastDownloadPercent = percent;
+          this.emitProgress({ type: 'model-download', progress });
+          this.debugLog('Model download progress', percent);
+        }
       },
     });
 
-    if (!result?.success) {
-      const message = result?.response || 'Model returned no response';
-      throw new Error(message);
+    // Some Cactus objects support an explicit init; call if present.
+    if (typeof lmInstance.init === 'function') {
+      await lmInstance.init();
     }
 
-    return stripThinkingBlocks(result.response);
-  }
-
-  private fallbackParseTextToFacts(text: string, topic: string): Fact[] {
-    const normalizedText = text.replace(/\r\n/g, '\n');
-    const sentences: string[] = [];
-
-    const lines = normalizedText.split('\n');
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (line.length === 0) {
-        continue;
-      }
-
-      // Split sentences while preserving punctuation.
-      const matches = line.match(/[^.!?]+[.!?]?/g);
-      if (matches) {
-        for (const fragment of matches) {
-          const cleaned = fragment.replace(/^[*-]\s*/, '').replace(/\s+/g, ' ').trim();
-          if (cleaned.length > 0) {
-            sentences.push(cleaned);
-          }
-        }
-      } else {
-        sentences.push(line.replace(/\s+/g, ' '));
-      }
-    }
-
-    const uniqueFacts = new Set<string>();
-    const facts: Fact[] = [];
-    const timestamp = new Date().toISOString();
-
-    for (const sentence of sentences) {
-      const trimmed = sentence.trim();
-      if (trimmed.length === 0) {
-        continue;
-      }
-
-      const normalized = trimmed.toLowerCase();
-      if (uniqueFacts.has(normalized)) {
-        continue;
-      }
-
-      uniqueFacts.add(normalized);
-      const bounded = trimmed.length > 200 ? trimmed.slice(0, 200).trimEnd() : trimmed;
-      if (bounded.length === 0) {
-        continue;
-      }
-
-      facts.push({
-        id: 0,
-        content: bounded,
-        topic,
-        source: 'default',
-        created_at: timestamp,
-      });
-
-      if (facts.length >= 120) {
-        break;
-      }
-    }
-
-    const totalChunks = 1;
-    this.emitProgress({ type: 'parse-start', topic, totalChunks });
-    this.emitProgress({ type: 'parse-chunk-start', topic, chunkIndex: 1, totalChunks });
-    this.emitProgress({
-      type: 'parse-chunk-complete',
-      topic,
-      chunkIndex: 1,
-      totalChunks,
-      factsGenerated: facts.length,
-    });
-    this.emitProgress({
-      type: 'parse-complete',
-      topic,
-      totalChunks,
-      factsGenerated: facts.length,
-    });
-
-    return facts;
+    return lmInstance;
   }
 
   async initialize(): Promise<void> {
-    if (this.initialized) {
-      return;
-    }
+    if (this.initialized) return;
 
     if (this.initializing) {
-      // Wait for ongoing initialization
-      return new Promise((resolve) => {
-        const checkInterval = setInterval(() => {
+      // If another call is already initializing, just wait for it.
+      await new Promise<void>((resolve) => {
+        const id = setInterval(() => {
           if (this.initialized) {
-            clearInterval(checkInterval);
+            clearInterval(id);
             resolve();
           }
         }, 100);
       });
+      return;
     }
 
     this.initializing = true;
 
     try {
-      // If cactus-react-native is not available, skip initialization gracefully.
       if (!CactusLMClass) {
         console.warn(
           '[AIService] cactus-react-native is not installed or failed to load. ' +
-            'AI features are disabled for now. See CACTUS_INSTALL.md for setup.',
+            'Using fallback (simple sentence splitter).',
         );
         this.fallbackEnabled = true;
         this.initialized = true;
@@ -278,35 +193,17 @@ class AIService {
       }
 
       const config = getModelConfig();
+      this.lm = await this.prepareModelInstance(config);
 
-      try {
-        const lmInstance = await this.prepareModelInstance(config);
-
-        if (typeof lmInstance.init === 'function') {
-          await lmInstance.init();
-        }
-
-        this.lm = lmInstance;
-        this.initialized = true;
-        this.initializing = false;
-        return;
-      } catch (error) {
-        console.error('[AIService] Failed to initialize Cactus model:', error);
-      }
-
-      console.warn(
-        '[AIService] Falling back to heuristic processing because Cactus model initialization failed.',
-      );
+      this.initialized = true;
+      this.initializing = false;
+      this.fallbackEnabled = false;
+    } catch (error) {
+      console.error('[AIService] Failed to initialize Cactus model, using fallback.', error);
       this.lm = null;
       this.fallbackEnabled = true;
-      this.initializing = false;
       this.initialized = true;
-      return;
-    } catch (error) {
       this.initializing = false;
-      console.error('Failed to initialize AI service:', error);
-      this.fallbackEnabled = true;
-      throw error;
     }
   }
 
@@ -316,102 +213,185 @@ class AIService {
     }
   }
 
+  // ---------- Core helper: one-shot completion ----------
+
+  private async runCompletion(
+    messages: CactusMessage[],
+    options: CompletionOptions = {},
+  ): Promise<string> {
+    if (!this.lm) {
+      throw new Error('Cactus model is not initialized');
+    }
+
+    const result = await this.lm.complete({
+      messages,
+      mode: 'local', // ensure offline / local model
+      temperature: options.temperature ?? 0.4,
+      maxTokens: options.maxTokens ?? 512,
+    });
+
+    // Cactus docs: `result.response` holds the text. :contentReference[oaicite:1]{index=1}
+    const raw = typeof result.response === 'string' ? result.response : '';
+    return stripThinkingBlocks(raw);
+  }
+
+  // ---------- PUBLIC API: parse big text to key facts ----------
+
   /**
-   * Parse large text into 200-character facts
+   * Given a big `text` and a `topic`, returns an array of Facts
+   * that you can directly JSON.stringify and store in your DB.
+   *
+   * Uses the local Cactus model when available; otherwise a simple
+   * sentence splitter as fallback.
    */
   async parseTextToFacts(text: string, topic: string): Promise<Fact[]> {
     await this.ensureInitialized();
 
+    const normalizedText = text.trim();
+    if (normalizedText.length === 0) {
+      return [];
+    }
+
+    // Fallback: no Cactus available
     if (this.fallbackEnabled || !this.lm) {
-      return this.fallbackParseTextToFacts(text, topic);
+      this.debugLog('parseTextToFacts using fallback sentence splitter');
+      return this.fallbackParseTextToFacts(normalizedText, topic);
     }
 
     try {
-      const normalizedText = text.trim();
-      if (normalizedText.length === 0) {
-        return [];
-      }
-
-      // Split text into chunks for processing (up to 6000 chars per chunk to reduce completion calls)
-      const chunkSize = normalizedText.length <= 6000 ? normalizedText.length : 6000;
+      const chunkSize = 6000; // chars; safe for local models
       const chunks: string[] = [];
-      
+
       for (let i = 0; i < normalizedText.length; i += chunkSize) {
         chunks.push(normalizedText.slice(i, i + chunkSize));
       }
 
       this.emitProgress({ type: 'parse-start', topic, totalChunks: chunks.length });
-      const allFacts: Fact[] = [];
 
-      for (let index = 0; index < chunks.length; index += 1) {
-        const chunkIndex = index + 1;
+      const allFacts: Fact[] = [];
+      const seen = new Set<string>();
+      const MAX_FACTS = 120;
+      const timestamp = new Date().toISOString();
+
+      for (let index = 0; index < chunks.length; index++) {
+        if (allFacts.length >= MAX_FACTS) break;
+
         const chunk = chunks[index];
+        const chunkIndex = index + 1;
+
         this.emitProgress({
           type: 'parse-chunk-start',
           topic,
           chunkIndex,
           totalChunks: chunks.length,
         });
-        const prompt = `You extract concise, standalone facts from text.
 
-Rules:
-- Only output the final facts.
-- Each fact MUST be on its own line.
+        const prompt = `
+You are a JSON API that extracts key facts from documents.
+
+TASK:
+- Read the document text.
+- Return ONLY valid JSON.
+- JSON format: an array of objects like:
+  [
+    { "content": "short fact <= 200 characters" },
+    { "content": "another key fact" }
+  ]
+
+RULES:
 - Each fact MUST be 200 characters or less.
-- Do NOT include any <think> tags or internal thoughts.
-- Do NOT explain your reasoning.
-- Do NOT add introductions or conclusions.
-- Do NOT number the facts (no "1.", "2.", "-", etc.).
-- Just output one fact per line.
+- Facts MUST be directly supported by the text.
+- No IDs, no metadata, no explanations, no comments.
+- Do NOT wrap the JSON in backticks.
+- Do NOT output anything except the JSON array.
 
-Text:
+Topic: "${topic}"
+
+Document:
 ${chunk}
 
-Facts:`.trim();
+JSON:
+        `.trim();
 
-        const messages: CompletionMessage[] = [
+        const messages: CactusMessage[] = [
           {
             role: 'system',
             content:
-              'You are an assistant that extracts short, standalone facts from text. ' +
-              'Respond ONLY with the final facts, one per line. Do NOT include <think> tags, ' +
-              'internal thoughts, or explanations. No numbering, no extra commentary.',
+              'You convert documents into key factual JSON. ' +
+              'Respond ONLY with a JSON array of objects: { "content": string }. ' +
+              'No extra text, no <think> tags, no comments.',
           },
           { role: 'user', content: prompt },
         ];
 
-        let response: string;
+        let modelResponse: string;
         try {
-          response = await this.runCompletion(messages, {
-            temperature: 0.45,
-            maxTokens: 256,
-            stopSequences: ['\n\n\n']
+          modelResponse = await this.runCompletion(messages, {
+            temperature: 0.3,
+            maxTokens: 384,
           });
         } catch (completionError) {
-          console.error('Error generating facts:', completionError);
+          console.error('[AIService] Error calling Cactus complete:', completionError);
           continue;
         }
-        
-        const cleanedResponse = stripThinkingBlocks(response);
 
-        // Parse facts from response (split by newlines)
-        const factLines = cleanedResponse
-          .split('\n')
-          .map((line) => line.trim())
-          .map((line) => line.replace(/^[\d]+\s*[\.\)\-:]\s*/, '').replace(/^[-•]\s*/, '').trim())
-          .filter((line) => line.length > 0 && line.length <= 200);
+        let parsedFacts = this.parseFactsJson(modelResponse);
 
-        // Create Fact objects
-        for (const content of factLines) {
-          if (content.length > 0) {
-            allFacts.push({
-              id: 0, // Will be set by database
-              content: content.substring(0, 200), // Ensure max 200 chars
+        if (parsedFacts.length === 0) {
+          this.debugLog('parseTextToFacts: model response missing JSON, requesting reformat', {
+            topic,
+            chunkIndex,
+            preview: this.preview(modelResponse, 220),
+          });
+
+          const recoveredFacts = await this.attemptJsonRecovery(modelResponse);
+          if (recoveredFacts.length > 0) {
+            this.debugLog('parseTextToFacts: JSON recovery succeeded', {
               topic,
-              source: 'default',
-              created_at: new Date().toISOString(),
+              chunkIndex,
+              count: recoveredFacts.length,
             });
+            parsedFacts = recoveredFacts;
           }
+        }
+
+        let acceptedCount = 0;
+
+        if (parsedFacts.length > 0) {
+          this.debugLog('parseTextToFacts: model JSON parsed', {
+            topic,
+            chunkIndex,
+            count: parsedFacts.length,
+            preview: this.preview(JSON.stringify(parsedFacts), 220),
+          });
+
+          acceptedCount = this.collectFactsFromContents(
+            parsedFacts.map((fact) => fact.content),
+            topic,
+            timestamp,
+            'cactus',
+            allFacts,
+            seen,
+            MAX_FACTS,
+          );
+        } else {
+          const fallbackSentences = this.splitTextIntoSentences(chunk);
+          acceptedCount = this.collectFactsFromContents(
+            fallbackSentences,
+            topic,
+            timestamp,
+            'fallback',
+            allFacts,
+            seen,
+            MAX_FACTS,
+          );
+
+          this.debugLog('parseTextToFacts: using sentence fallback', {
+            topic,
+            chunkIndex,
+            count: acceptedCount,
+            preview: this.preview(JSON.stringify(fallbackSentences.slice(0, 5)), 220),
+          });
         }
 
         this.emitProgress({
@@ -419,8 +399,10 @@ Facts:`.trim();
           topic,
           chunkIndex,
           totalChunks: chunks.length,
-          factsGenerated: factLines.length,
+          factsGenerated: acceptedCount,
         });
+
+        if (allFacts.length >= MAX_FACTS) break;
       }
 
       this.emitProgress({
@@ -429,298 +411,162 @@ Facts:`.trim();
         totalChunks: chunks.length,
         factsGenerated: allFacts.length,
       });
+
       return allFacts;
     } catch (error) {
-      console.error('Error parsing text to facts:', error);
+      console.error('[AIService] Error parsing text to facts:', error);
       const message = error instanceof Error ? error.message : 'Unknown parsing error';
       this.emitProgress({ type: 'parse-error', topic, message });
       throw error;
     }
   }
 
+  // ---------- JSON parsing helper ----------
+
   /**
-   * Analyze user preferences based on interactions
+   * Try to interpret the model output as JSON array of { content: string }.
+   * Robust to models that add junk before/after the array.
    */
-  async analyzeUserPreference(interactions: Interaction[]): Promise<PreferenceAnalysis> {
-    await this.ensureInitialized();
+  private parseFactsJson(
+    raw: string,
+  ): Array<{ content: string }> {
+    const cleaned = stripThinkingBlocks(raw).trim();
+    if (!cleaned) return [];
 
-    const baselineAnalysis = (): PreferenceAnalysis => {
-      if (interactions.length === 0) {
-        return {
-          preferred_topics: [],
-          disliked_topics: [],
-          neutral_topics: [],
-          overall_scores: {},
-        };
-      }
-
-      const rightSwipes = interactions.filter((i) => i.direction === 'right').length;
-      const leftSwipes = interactions.filter((i) => i.direction === 'left').length;
-      const preferenceRatio = rightSwipes / (rightSwipes + leftSwipes || 1);
-
-      return {
-        preferred_topics: preferenceRatio > 0.6 ? ['general'] : [],
-        disliked_topics: preferenceRatio < 0.4 ? ['general'] : [],
-        neutral_topics: [],
-        overall_scores: { general: Number(((preferenceRatio - 0.5) * 2).toFixed(2)) },
-      };
-    };
-
-    if (this.fallbackEnabled || !this.lm) {
-      return baselineAnalysis();
-    }
-
-    if (interactions.length === 0) {
-      return baselineAnalysis();
-    }
+    // Try to extract the first [...] block
+    const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
+    const candidate = arrayMatch ? arrayMatch[0] : cleaned;
 
     try {
-      // Group interactions by topic (we need to get facts first)
-      // For now, we'll analyze based on swipe directions
-      const rightSwipes = interactions.filter(i => i.direction === 'right').length;
-      const leftSwipes = interactions.filter(i => i.direction === 'left').length;
+      const parsed = JSON.parse(candidate);
 
-      const prompt = `Based on the following user interactions, analyze their preferences:
-- Right swipes (interested): ${rightSwipes}
-- Left swipes (not interested): ${leftSwipes}
-- Total interactions: ${interactions.length}
+      if (!Array.isArray(parsed)) return [];
 
-Analyze the pattern and provide a JSON response with:
-{
-  "preferred_topics": ["topic1", "topic2"],
-  "disliked_topics": ["topic3"],
-  "neutral_topics": ["topic4"],
-  "overall_scores": {"topic1": 0.8, "topic2": 0.6, "topic3": -0.5}
-}
+      const facts: Array<{ content: string }> = [];
 
-Only respond with valid JSON.`;
+      for (const item of parsed) {
+        if (item && typeof item === 'object') {
+          const content =
+            typeof (item as any).content === 'string'
+              ? (item as any).content
+              : typeof (item as any).fact === 'string'
+              ? (item as any).fact
+              : '';
 
-      const messages: CompletionMessage[] = [
-        {
-          role: 'system',
-          content:
-            'You analyze interaction summaries and return JSON. ' +
-            'Respond ONLY with the final JSON payload. Do NOT include <think> tags, reasoning, or commentary.',
-        },
-        { role: 'user', content: prompt },
-      ];
-
-      let response: string;
-      try {
-        response = await this.runCompletion(messages, {
-          temperature: 0.6,
-          maxTokens: 400,
-          stopSequences: ['```'],
-        });
-      } catch (completionError) {
-        console.error('Error analyzing preferences:', completionError);
-        return {
-          preferred_topics: [],
-          disliked_topics: [],
-          neutral_topics: [],
-          overall_scores: {},
-        };
-      }
-
-      try {
-        const jsonMatch = response.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const analysis = JSON.parse(jsonMatch[0]);
-          return analysis as PreferenceAnalysis;
+          if (content.trim().length > 0) {
+            facts.push({ content: content.trim() });
+          }
         }
-      } catch (parseError) {
-        console.error('Error parsing preference analysis JSON:', parseError);
       }
-
-      // Fallback: simple analysis based on ratios
-      return baselineAnalysis();
-    } catch (error) {
-      console.error('Error analyzing user preference:', error);
-      return baselineAnalysis();
-    }
-  }
-
-  /**
-   * Generate related facts for a topic when user swipes right
-   */
-  async generateRelatedFacts(topic: string, currentFact: string): Promise<string[]> {
-    await this.ensureInitialized();
-
-    if (this.fallbackEnabled || !this.lm) {
-      return [];
-    }
-
-    try {
-      const prompt = `Based on this fact about ${topic}:
-"${currentFact}"
-
-Generate 3 related, interesting facts about ${topic}. Each fact should be exactly 200 characters or less. Format each fact on a new line.
-
-Related facts:`;
-
-      const messages: CompletionMessage[] = [
-        {
-          role: 'system',
-          content:
-            'You generate related standalone facts. ' +
-            'Respond ONLY with the final facts, each on its own line. ' +
-            'Do NOT include <think> tags, internal reasoning, or commentary.',
-        },
-        { role: 'user', content: prompt },
-      ];
-
-      let response: string;
-      try {
-        response = await this.runCompletion(messages, {
-          temperature: 0.7,
-          maxTokens: 512,
-        });
-      } catch (completionError) {
-        console.error('Error generating related facts:', completionError);
-        return [];
-      }
-      
-      // Parse facts from response
-      const facts = response
-        .split('\n')
-        .map(line => line.trim())
-        .filter(line => line.length > 0 && line.length <= 200)
-        .slice(0, 3); // Limit to 3 facts
 
       return facts;
-    } catch (error) {
-      console.error('Error generating related facts:', error);
-      throw error;
+    } catch (e) {
+      console.warn('[AIService] Failed to parse JSON from model output, returning empty list.', e);
+      return [];
     }
   }
 
-  private parseQuizBatch(raw: string, expected: number): QuizQuestion[] {
-    const arrayMatch = raw.match(/\[[\s\S]*\]/);
-    if (!arrayMatch) {
+  private async attemptJsonRecovery(rawResponse: string): Promise<Array<{ content: string }>> {
+    const cleaned = stripThinkingBlocks(rawResponse).trim();
+    if (!cleaned || !this.lm) {
       return [];
     }
 
-    const candidates = new Set<string>();
-    const base = arrayMatch[0].trim();
-    candidates.add(base);
-
-    const sanitizedKeys = base.replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":');
-    const sanitizedValues = sanitizedKeys.replace(/'([^']*)'/g, (_, value: string) => {
-      const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-      return `"${escaped}"`;
-    });
-    const sanitizedTrailingCommas = sanitizedValues.replace(/,\s*([}\]])/g, '$1');
-    candidates.add(sanitizedTrailingCommas);
-
-    for (const candidate of candidates) {
-      try {
-        const parsed = JSON.parse(candidate);
-        if (!Array.isArray(parsed)) {
-          continue;
-        }
-        const questions: QuizQuestion[] = parsed
-          .filter((item: any) => typeof item === 'object' && item !== null)
-          .map((item: any) => {
-            const question = typeof item.question === 'string' ? item.question.trim() : '';
-            const options = Array.isArray(item.options)
-                ? item.options
-                  .filter((option: unknown): option is string => typeof option === 'string' && option.trim().length > 0)
-                  .map((option: string) => option.trim())
-              : [];
-            const numericAnswer = typeof item.correct_answer === 'number' ? item.correct_answer : 0;
-            const normalizedAnswer = Number.isFinite(numericAnswer)
-              ? Math.max(0, Math.min(options.length - 1, Math.floor(numericAnswer)))
-              : 0;
-
-            return {
-              question,
-              options,
-              correct_answer: normalizedAnswer,
-            };
-          })
-          .filter((item) => item.question.length > 0 && item.options.length === 4);
-
-        if (questions.length > 0) {
-          return questions.slice(0, expected > 0 ? expected : questions.length);
-        }
-      } catch {
-        // Try next candidate
-      }
-    }
-
-    return [];
-  }
-
-  async generateQuizQuestions(topic: string, factContents: string[]): Promise<QuizQuestion[]> {
-    await this.ensureInitialized();
-
-    if (this.fallbackEnabled || !this.lm || factContents.length === 0) {
-      return [];
-    }
-
-    const limitedFacts = factContents.slice(0, 8);
-    const promptFacts = limitedFacts
-      .map((content, index) => `${index + 1}. ${content}`)
-      .join('\n');
-
-    const prompt = `You are creating quiz questions for the topic "${topic}". Use the numbered facts below to generate one multiple-choice question per fact. Each question must test understanding of the fact directly.
-
-Facts:
-${promptFacts}
-
-Return a JSON array where each element is of the form:
-{
-  "question": "Question text?",
-  "options": ["Option A", "Option B", "Option C", "Option D"],
-  "correct_answer": 0
-}
-
-Rules:
-- Provide exactly ${limitedFacts.length} quiz objects in the same order as the facts above.
-- Use double quotes around all keys and string values.
-- Each options array must contain four concise answers (<80 characters).
-- Set correct_answer to the zero-based index of the correct option.
-- Reply with JSON only.`;
-
-    const messages: CompletionMessage[] = [
+    const messages: CactusMessage[] = [
       {
         role: 'system',
         content:
-          'You generate multiple-choice quiz questions. ' +
-          'Respond ONLY with the final JSON array described by the user. ' +
-          'Do NOT include <think> tags, explanations, or commentary.',
+          'You reformat replies into strict JSON arrays of { "content": string }. Output only JSON.',
       },
-      { role: 'user', content: prompt },
+      {
+        role: 'user',
+        content:
+          `Convert the following text into a JSON array where each element is an object with a "content" field (<= 200 characters). Each fact must remain separate.\n\nText:\n${cleaned}`,
+      },
     ];
 
     try {
       const response = await this.runCompletion(messages, {
-        temperature: 0.35,
-        maxTokens: 512,
-        stopSequences: ['```'],
+        temperature: 0.1,
+        maxTokens: 384,
       });
 
-      const parsed = this.parseQuizBatch(response, limitedFacts.length);
-      if (parsed.length === 0) {
-        console.warn('[AIService] Quiz generation returned no valid items.');
-      }
-      return parsed;
+      return this.parseFactsJson(response);
     } catch (error) {
-      console.warn('[AIService] Quiz generation failed. Skipping quizzes.', error);
+      this.debugLog('attemptJsonRecovery failed', error);
       return [];
     }
   }
 
-  /**
-   * Check if the service is initialized
-   */
+  private collectFactsFromContents(
+    contents: Iterable<string>,
+    topic: string,
+    timestamp: string,
+    source: 'cactus' | 'fallback',
+    allFacts: Fact[],
+    seen: Set<string>,
+    maxFacts: number,
+  ): number {
+    let accepted = 0;
+
+    for (const rawContent of contents) {
+      if (allFacts.length >= maxFacts) break;
+
+      const content = rawContent.trim();
+      if (!content) continue;
+
+      const truncated = content.slice(0, 200);
+      const normalized = truncated.toLowerCase();
+      if (seen.has(normalized)) continue;
+
+      seen.add(normalized);
+      allFacts.push({
+        id: 0,
+        content: truncated,
+        topic,
+        source: source as unknown as Fact['source'],
+        created_at: timestamp,
+      });
+      accepted++;
+    }
+
+    return accepted;
+  }
+
+  private splitTextIntoSentences(text: string): string[] {
+    const cleaned = text.replace(/\s+/g, ' ').trim();
+    if (!cleaned) return [];
+
+    return cleaned
+      .split(/(?<=[.!?])\s+/)
+      .map((sentence) => sentence.trim())
+      .filter((sentence) => sentence.length > 0);
+  }
+
+  // ---------- Simple fallback if Cactus is not available ----------
+
+  private fallbackParseTextToFacts(text: string, topic: string): Fact[] {
+    const sentences = this.splitTextIntoSentences(text);
+    const MAX_FACTS = 60;
+    const timestamp = new Date().toISOString();
+
+    return sentences
+      .slice(0, MAX_FACTS)
+      .map<Fact>((sentence) => ({
+        id: 0,
+        content: sentence.slice(0, 200),
+        topic,
+        source: 'fallback' as unknown as Fact['source'],
+        created_at: timestamp,
+      }));
+  }
+
+  // ---------- Lifecycle helpers ----------
+
   isInitialized(): boolean {
     return this.initialized;
   }
 
-  /**
-   * Clean up resources
-   */
   async destroy(): Promise<void> {
     if (this.lm) {
       try {
@@ -728,7 +574,7 @@ Rules:
           await this.lm.destroy();
         }
       } catch (error) {
-        console.error('Error destroying model:', error);
+        console.error('[AIService] Error destroying model:', error);
       }
       this.lm = null;
       this.initialized = false;
@@ -737,4 +583,3 @@ Rules:
 }
 
 export const aiService = new AIService();
-
