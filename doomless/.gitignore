@@ -73,3 +73,7 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Local model assets
+android/app/src/main/assets/models/
+!android/app/src/main/assets/models/.gitkeep

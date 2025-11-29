@@ -1,5 +1,4 @@
 import RNFS from 'react-native-fs';
-import { Platform } from 'react-native';
 import { textProcessor } from './TextProcessor';
 import { storageService } from './StorageService';
 import { UserDocumentInput } from '../types/UserDocument';

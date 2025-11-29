@@ -53,7 +53,9 @@ class TextProcessor {
       // Process text into facts using AI
       const facts = await aiService.parseTextToFacts(text, topic);
 
+      aiService.emitProgress({ type: 'storage-save-progress', topic, saved: 0, total: facts.length });
       // Store facts in database
+      let savedCount = 0;
       for (const fact of facts) {
         const factInput: FactInput = {
           content: fact.content,
@@ -61,10 +63,14 @@ class TextProcessor {
           source: 'default',
         };
         await storageService.insertFact(factInput);
+        savedCount += 1;
+        aiService.emitProgress({ type: 'storage-save-progress', topic, saved: savedCount, total: facts.length });
       }
 
       // Add quiz facts every 5-10 facts
-      await this.addQuizFacts(topic, facts.length);
+      await this.addQuizFacts(topic, facts);
+
+      aiService.emitProgress({ type: 'storage-complete', topic, total: facts.length });
 
       console.log(`Processed ${facts.length} facts for topic: ${topic}`);
     } catch (error) {
@@ -147,116 +153,51 @@ class TextProcessor {
   /**
    * Add quiz facts periodically (every 5-10 facts)
    */
-  private async addQuizFacts(topic: string, totalFacts: number): Promise<void> {
-    // Add a quiz every 7 facts on average
-    const quizInterval = 7;
-    const numQuizzes = Math.floor(totalFacts / quizInterval);
+  private async addQuizFacts(topic: string, facts: Fact[]): Promise<void> {
+    const totalFacts = facts.length;
+    if (totalFacts === 0) {
+      return;
+    }
 
-    for (let i = 0; i < numQuizzes; i++) {
+    const quizInterval = 8;
+    const maxQuizzes = Math.min(5, Math.floor(totalFacts / quizInterval) || (totalFacts >= 4 ? 1 : 0));
+    if (maxQuizzes <= 0) {
+      return;
+    }
+
+    const step = Math.max(1, Math.floor(totalFacts / maxQuizzes));
+    const selectedFacts: Fact[] = [];
+    for (let index = 0; index < totalFacts && selectedFacts.length < maxQuizzes; index += step) {
+      selectedFacts.push(facts[index]);
+    }
+
+    const expectedQuizzes = selectedFacts.length;
+    aiService.emitProgress({ type: 'quiz-start', topic, total: expectedQuizzes });
+
+    const quizQuestions = await aiService.generateQuizQuestions(
+      topic,
+      selectedFacts.map((fact) => fact.content),
+    );
+
+    let inserted = 0;
+    for (const quiz of quizQuestions) {
       try {
-        // Get a random fact from the topic to create a quiz about
-        const facts = await storageService.getFacts(topic, 1, i * quizInterval);
-        if (facts.length > 0) {
-          const fact = facts[0];
-          
-          // Generate quiz question using AI (simplified - in production, use AI to generate)
-          const quizData = await this.generateQuizQuestion(fact.content, topic);
-          
-          if (quizData) {
-            const quizFact: FactInput = {
-              content: `Quiz: ${quizData.question}`,
-              topic,
-              source: 'default',
-              is_quiz: true,
-              quiz_data: quizData,
-            };
-            await storageService.insertFact(quizFact);
-          }
-        }
+        const quizFact: FactInput = {
+          content: `Quiz: ${quiz.question}`,
+          topic,
+          source: 'default',
+          is_quiz: true,
+          quiz_data: quiz,
+        };
+        await storageService.insertFact(quizFact);
+        inserted += 1;
+        aiService.emitProgress({ type: 'quiz-progress', topic, current: inserted, total: expectedQuizzes });
       } catch (error) {
-        console.error('Error adding quiz fact:', error);
+        console.error('Error inserting quiz fact:', error);
       }
     }
-  }
 
-  /**
-   * Generate a quiz question based on a fact
-   */
-  private async generateQuizQuestion(factContent: string, topic: string): Promise<{
-    question: string;
-    options: string[];
-    correct_answer: number;
-  } | null> {
-    try {
-      await aiService.ensureInitialized();
-      const lm = (aiService as any).lm;
-      
-      if (!lm) {
-        return null;
-      }
-
-      const prompt = `Based on this fact: "${factContent}"
-
-Generate a multiple-choice quiz question with 4 options. Respond in JSON format:
-{
-  "question": "What is the question?",
-  "options": ["option1", "option2", "option3", "option4"],
-  "correct_answer": 0
-}
-
-Only respond with valid JSON.`;
-
-      const messages = [
-        { role: 'user' as const, content: prompt }
-      ];
-
-      // Try different API patterns for CactusLM
-      let result: any;
-      
-      try {
-        result = await lm.complete({ messages });
-      } catch (err) {
-        try {
-          result = await lm.completion(messages, {
-            n_predict: 500,
-            temperature: 0.7,
-          });
-          if (result && result.text) {
-            result = { response: result.text, error: null };
-          }
-        } catch (err2) {
-          console.error('Error generating quiz:', err2);
-          return null;
-        }
-      }
-      
-      if (result.error) {
-        console.error('Error generating quiz:', result.error);
-        return null;
-      }
-
-      try {
-        const response = result.response || '';
-        const jsonMatch = response.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const quiz = JSON.parse(jsonMatch[0]);
-          if (quiz.question && quiz.options && Array.isArray(quiz.options) && quiz.options.length === 4) {
-            return {
-              question: quiz.question,
-              options: quiz.options,
-              correct_answer: quiz.correct_answer || 0,
-            };
-          }
-        }
-      } catch (parseError) {
-        console.error('Error parsing quiz JSON:', parseError);
-      }
-
-      return null;
-    } catch (error) {
-      console.error('Error generating quiz question:', error);
-      return null;
-    }
+    aiService.emitProgress({ type: 'quiz-complete', topic, total: inserted });
   }
 
   /**

@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback } from 'react';
 import { storageService } from '../services/StorageService';
 import { aiService } from '../services/AIService';
 import { UserPreference, PreferenceAnalysis } from '../types/Preferences';
-import { Interaction } from '../types/Interaction';
 
 interface UseUserPreferencesReturn {
   preferences: UserPreference[];

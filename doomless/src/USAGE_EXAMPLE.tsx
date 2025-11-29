@@ -73,6 +73,15 @@ export function FactsScreen() {
         </View>
       ))}
       <Button title="Refresh" onPress={refresh} />
+      <View>
+        <Text>User preference preview</Text>
+        {preferences.slice(0, 3).map((pref) => (
+          <Text key={pref.id}>
+            {pref.topic}: {pref.preference_score.toFixed(2)}
+          </Text>
+        ))}
+        <Button title="Analyze preferences" onPress={analyzePreferences} />
+      </View>
     </View>
   );
 }
@@ -91,7 +100,7 @@ export async function processUserPDF(filePath: string, filename: string) {
 
 // Example: Get user preferences
 export function PreferencesScreen() {
-  const { preferences, analysis, loading, getPreferenceScore } = useUserPreferences();
+  const { preferences, analysis, loading } = useUserPreferences();
 
   if (loading) {
     return <Text>Loading preferences...</Text>;

@@ -1,22 +1,232 @@
-// CactusLM import - may need to be installed manually
-// See CACTUS_INSTALL.md for installation instructions
-let CactusLM: any;
-try {
-  CactusLM = require('cactus-react-native').CactusLM;
-} catch (error) {
-  console.warn('cactus-react-native not found. AI features will not work until installed.');
-  // Create a stub for development
-  CactusLM = null;
-}
+import { Platform } from 'react-native';
+import RNFS from 'react-native-fs';
 import { Fact } from '../types/Fact';
 import { Interaction } from '../types/Interaction';
 import { PreferenceAnalysis } from '../types/Preferences';
-import { getModelPath, verifyModelExists, getModelConfig } from '../utils/modelLoader';
+import { getModelConfig, type ModelConfig } from '../utils/modelLoader';
+
+export type AIProgressEvent =
+  | { type: 'model-download'; modelId: string; progress: number }
+  | { type: 'parse-start'; topic: string; totalChunks: number }
+  | { type: 'parse-chunk-start'; topic: string; chunkIndex: number; totalChunks: number }
+  | {
+      type: 'parse-chunk-complete';
+      topic: string;
+      chunkIndex: number;
+      totalChunks: number;
+      factsGenerated: number;
+    }
+  | { type: 'parse-complete'; topic: string; totalChunks: number; factsGenerated: number }
+  | { type: 'parse-error'; topic: string; message: string }
+  | { type: 'storage-save-progress'; topic: string; saved: number; total: number }
+  | { type: 'storage-complete'; topic: string; total: number }
+  | { type: 'quiz-start'; topic: string; total: number }
+  | { type: 'quiz-progress'; topic: string; current: number; total: number }
+  | { type: 'quiz-complete'; topic: string; total: number };
+
+type ProgressListener = (event: AIProgressEvent) => void;
+
+export type QuizQuestion = {
+  question: string;
+  options: string[];
+  correct_answer: number;
+};
+
+type CompletionMessage = {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  images?: string[];
+};
+
+// Cactus React Native bridge imports (gracefully degraded when module is missing)
+let CactusLMClass: any = null;
+try {
+  CactusLMClass = require('cactus-react-native').CactusLM;
+} catch {
+  console.warn('cactus-react-native not found. AI features will not work until installed.');
+}
+
+let CactusFileSystem: any = null;
+if (CactusLMClass) {
+  try {
+    CactusFileSystem = require('cactus-react-native/lib/module/native/CactusFileSystem').CactusFileSystem;
+  } catch {
+    try {
+      CactusFileSystem = require('cactus-react-native/src/native/CactusFileSystem').CactusFileSystem;
+    } catch {
+      CactusFileSystem = null;
+    }
+  }
+}
 
 class AIService {
   private lm: any = null;
   private initialized = false;
   private initializing = false;
+  private currentModelId: string | null = null;
+  private downloadProgress: Record<string, number> = {};
+  private progressListeners = new Set<ProgressListener>();
+
+  subscribeProgress(listener: ProgressListener): () => void {
+    this.progressListeners.add(listener);
+    return () => {
+      this.progressListeners.delete(listener);
+    };
+  }
+
+  emitProgress(event: AIProgressEvent): void {
+    this.progressListeners.forEach((listener) => {
+      try {
+        listener(event);
+      } catch (error) {
+        console.error('[AIService] Progress listener failed:', error);
+      }
+    });
+  }
+
+  private getCandidateModels(config: ModelConfig): string[] {
+    const candidates = new Set<string>();
+    if (config.modelId) {
+      candidates.add(config.modelId);
+    }
+    if (config.fallbackModelId) {
+      candidates.add(config.fallbackModelId);
+    }
+    return Array.from(candidates);
+  }
+
+  private createModelInstance(modelId: string, contextSize: number): any {
+    if (!CactusLMClass) {
+      return null;
+    }
+    return new CactusLMClass({ model: modelId, contextSize });
+  }
+
+  private async isModelCached(modelId: string): Promise<boolean> {
+    if (!CactusFileSystem) {
+      return false;
+    }
+
+    try {
+      return await CactusFileSystem.modelExists(modelId);
+    } catch (error) {
+      console.warn(`[AIService] Failed to query Cactus model cache for "${modelId}":`, error);
+      return false;
+    }
+  }
+
+  private async installBundledModel(modelId: string, assetFileName: string): Promise<boolean> {
+    if (!CactusFileSystem || Platform.OS !== 'android') {
+      return false;
+    }
+
+    try {
+      const cactusDir: string = await CactusFileSystem.getCactusDirectory();
+      const modelDir = `${cactusDir}/models/${modelId}`;
+      const destination = `${modelDir}/${assetFileName}`;
+
+      const exists = await RNFS.exists(destination);
+      if (exists) {
+        return true;
+      }
+
+      await RNFS.mkdir(modelDir, { NSURLIsExcludedFromBackupKey: true });
+      await RNFS.copyFileAssets(`models/${assetFileName}`, destination);
+      console.log(`[AIService] Seeded bundled model asset at ${destination}`);
+      return true;
+    } catch (error) {
+      console.error(`[AIService] Failed to seed bundled model asset "${assetFileName}":`, error);
+      return false;
+    }
+  }
+
+  private async prepareModelInstance(
+    modelId: string,
+    config: ModelConfig,
+    allowBundledSeed: boolean,
+  ): Promise<any> {
+    const contextSize = config.contextSize ?? 2048;
+    const instance = this.createModelInstance(modelId, contextSize);
+
+    if (!instance) {
+      throw new Error(
+        'cactus-react-native is not installed. Please install it following the instructions in CACTUS_INSTALL.md.',
+      );
+    }
+
+    if (await this.isModelCached(modelId)) {
+      return instance;
+    }
+
+    if (
+      allowBundledSeed &&
+      config.useBundledAsset &&
+      config.assetFileName &&
+      (await this.installBundledModel(modelId, config.assetFileName)) &&
+      (await this.isModelCached(modelId))
+    ) {
+      return instance;
+    }
+
+    if (typeof instance.download === 'function') {
+      try {
+        await instance.download({
+          onProgress: (progress: number) => {
+            if (!Number.isFinite(progress)) {
+              return;
+            }
+            const pct = Math.round(progress * 100);
+            if (this.downloadProgress[modelId] === pct) {
+              return;
+            }
+            this.downloadProgress[modelId] = pct;
+            if (pct % 5 === 0 || pct === 100) {
+              console.log(`[AIService] Downloading model "${modelId}"… ${pct}%`);
+            }
+            this.emitProgress({ type: 'model-download', modelId, progress });
+          },
+        });
+        return instance;
+      } catch (error) {
+        throw new Error(`Failed to download Cactus model "${modelId}": ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    throw new Error(`Model "${modelId}" is not available locally and cannot be downloaded.`);
+  }
+
+  private async runCompletion(
+    messages: CompletionMessage[],
+    options: {
+      temperature?: number;
+      topP?: number;
+      topK?: number;
+      maxTokens?: number;
+      stopSequences?: string[];
+    } = {},
+  ): Promise<string> {
+    if (!this.lm) {
+      throw new Error('Model not initialized');
+    }
+
+    const result = await this.lm.complete({
+      messages,
+      options: {
+        temperature: options.temperature,
+        topP: options.topP,
+        topK: options.topK,
+        maxTokens: options.maxTokens,
+        stopSequences: options.stopSequences,
+      },
+    });
+
+    if (!result?.success) {
+      const message = result?.response || 'Model returned no response';
+      throw new Error(message);
+    }
+
+    return result.response;
+  }
 
   async initialize(): Promise<void> {
     if (this.initialized) {
@@ -38,8 +248,8 @@ class AIService {
     this.initializing = true;
 
     try {
-      // If CactusLM native module is not available, skip initialization gracefully.
-      if (!CactusLM) {
+      // If cactus-react-native is not available, skip initialization gracefully.
+      if (!CactusLMClass) {
         console.warn(
           '[AIService] cactus-react-native is not installed or failed to load. ' +
             'AI features are disabled for now. See CACTUS_INSTALL.md for setup.',
@@ -49,71 +259,35 @@ class AIService {
         return;
       }
 
-      const modelPath = await getModelPath();
-      const exists = await verifyModelExists(modelPath);
-
-      if (!exists) {
-        console.error(
-          `[AIService] Model file not found at: ${modelPath}. ` +
-            'The app will run, but AI features are disabled. ' +
-            'Make sure android/app/src/main/assets/models/model.gguf exists and is a real GGUF model.',
-        );
-        // Do not throw here to avoid crashing the app; leave AI uninitialized.
-        this.initializing = false;
-        this.initialized = false;
-        return;
-      }
-
-      if (!CactusLM) {
-        throw new Error(
-          'cactus-react-native is not installed. Please install it following the instructions in CACTUS_INSTALL.md'
-        );
-      }
-
       const config = getModelConfig();
-      
-      // Initialize CactusLM - API may vary, try both patterns
-      let lm: any;
-      let error: any;
-      
-      try {
-        // Try new CactusLM() pattern
-        const cactusLM = new CactusLM();
-        const result = await cactusLM.init({
-          model: modelPath,
-          n_ctx: config.n_ctx || 2048,
-        });
-        
-        if (result.error) {
-          error = result.error;
-        } else {
-          lm = result.lm || cactusLM;
-        }
-      } catch (initError) {
-        // Try alternative initialization pattern
+      const candidates = this.getCandidateModels(config);
+      let lastError: unknown;
+
+      for (const modelId of candidates) {
         try {
-          const result = await CactusLM.init({
-            model: modelPath,
-            n_ctx: config.n_ctx || 2048,
-          });
-          
-          if (result.error) {
-            error = result.error;
-          } else {
-            lm = result.lm;
-          }
-        } catch (altError) {
-          error = altError;
+          const lmInstance = await this.prepareModelInstance(
+            modelId,
+            config,
+            modelId === config.modelId,
+          );
+          await lmInstance.init();
+
+          this.lm = lmInstance;
+          this.currentModelId = modelId;
+          this.initialized = true;
+          this.initializing = false;
+          return;
+        } catch (error) {
+          lastError = error;
+          console.error(`[AIService] Failed to initialize model "${modelId}":`, error);
         }
       }
 
-      if (error || !lm) {
-        throw new Error(`Failed to initialize model: ${error || 'Unknown error'}`);
-      }
-
-      this.lm = lm;
-      this.initialized = true;
       this.initializing = false;
+      this.initialized = false;
+      throw lastError instanceof Error
+        ? lastError
+        : new Error('Failed to initialize Cactus model');
     } catch (error) {
       this.initializing = false;
       console.error('Failed to initialize AI service:', error);
@@ -138,17 +312,31 @@ class AIService {
     }
 
     try {
-      // Split text into chunks for processing (2000 chars per chunk)
-      const chunkSize = 2000;
-      const chunks: string[] = [];
-      
-      for (let i = 0; i < text.length; i += chunkSize) {
-        chunks.push(text.slice(i, i + chunkSize));
+      const normalizedText = text.trim();
+      if (normalizedText.length === 0) {
+        return [];
       }
 
+      // Split text into chunks for processing (up to 6000 chars per chunk to reduce completion calls)
+      const chunkSize = normalizedText.length <= 6000 ? normalizedText.length : 6000;
+      const chunks: string[] = [];
+      
+      for (let i = 0; i < normalizedText.length; i += chunkSize) {
+        chunks.push(normalizedText.slice(i, i + chunkSize));
+      }
+
+      this.emitProgress({ type: 'parse-start', topic, totalChunks: chunks.length });
       const allFacts: Fact[] = [];
 
-      for (const chunk of chunks) {
+      for (let index = 0; index < chunks.length; index += 1) {
+        const chunkIndex = index + 1;
+        const chunk = chunks[index];
+        this.emitProgress({
+          type: 'parse-chunk-start',
+          topic,
+          chunkIndex,
+          totalChunks: chunks.length,
+        });
         const prompt = `Extract concise, interesting facts from the following text. Each fact should be exactly 200 characters or less. Format each fact on a new line. Only extract factual information, not opinions.
 
 Text:
@@ -156,38 +344,19 @@ ${chunk}
 
 Facts:`;
 
-        const messages = [
-          { role: 'user' as const, content: prompt }
-        ];
+        const messages: CompletionMessage[] = [{ role: 'user', content: prompt }];
 
-        // Try different API patterns for CactusLM
-        let result: any;
-        
+        let response: string;
         try {
-          // Try .complete() method
-          result = await this.lm.complete({ messages });
-        } catch (err) {
-          try {
-            // Try .completion() method
-            result = await this.lm.completion(messages, {
-              n_predict: 500,
-              temperature: 0.7,
-            });
-            // Normalize response format
-            if (result && result.text) {
-              result = { response: result.text, error: null };
-            }
-          } catch (err2) {
-            throw new Error(`Model inference failed: ${err2}`);
-          }
-        }
-        
-        if (result.error) {
-          console.error('Error generating facts:', result.error);
+          response = await this.runCompletion(messages, {
+            temperature: 0.45,
+            maxTokens: 256,
+            stopSequences: ['\n\n\n']
+          });
+        } catch (completionError) {
+          console.error('Error generating facts:', completionError);
           continue;
         }
-
-        const response = result.response || '';
         
         // Parse facts from response (split by newlines)
         const factLines = response
@@ -207,11 +376,27 @@ Facts:`;
             });
           }
         }
+
+        this.emitProgress({
+          type: 'parse-chunk-complete',
+          topic,
+          chunkIndex,
+          totalChunks: chunks.length,
+          factsGenerated: factLines.length,
+        });
       }
 
+      this.emitProgress({
+        type: 'parse-complete',
+        topic,
+        totalChunks: chunks.length,
+        factsGenerated: allFacts.length,
+      });
       return allFacts;
     } catch (error) {
       console.error('Error parsing text to facts:', error);
+      const message = error instanceof Error ? error.message : 'Unknown parsing error';
+      this.emitProgress({ type: 'parse-error', topic, message });
       throw error;
     }
   }
@@ -256,32 +441,17 @@ Analyze the pattern and provide a JSON response with:
 
 Only respond with valid JSON.`;
 
-      const messages = [
-        { role: 'user' as const, content: prompt }
-      ];
+      const messages: CompletionMessage[] = [{ role: 'user', content: prompt }];
 
-      // Try different API patterns for CactusLM
-      let result: any;
-      
+      let response: string;
       try {
-        result = await this.lm.complete({ messages });
-      } catch (err) {
-        try {
-          result = await this.lm.completion(messages, {
-            n_predict: 500,
-            temperature: 0.7,
-          });
-          if (result && result.text) {
-            result = { response: result.text, error: null };
-          }
-        } catch (err2) {
-          throw new Error(`Model inference failed: ${err2}`);
-        }
-      }
-      
-      if (result.error) {
-        console.error('Error analyzing preferences:', result.error);
-        // Return default analysis
+        response = await this.runCompletion(messages, {
+          temperature: 0.6,
+          maxTokens: 400,
+          stopSequences: ['```'],
+        });
+      } catch (completionError) {
+        console.error('Error analyzing preferences:', completionError);
         return {
           preferred_topics: [],
           disliked_topics: [],
@@ -291,8 +461,6 @@ Only respond with valid JSON.`;
       }
 
       try {
-        // Try to parse JSON from response
-        const response = result.response || '';
         const jsonMatch = response.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           const analysis = JSON.parse(jsonMatch[0]);
@@ -334,35 +502,18 @@ Generate 3 related, interesting facts about ${topic}. Each fact should be exactl
 
 Related facts:`;
 
-      const messages = [
-        { role: 'user' as const, content: prompt }
-      ];
+      const messages: CompletionMessage[] = [{ role: 'user', content: prompt }];
 
-      // Try different API patterns for CactusLM
-      let result: any;
-      
+      let response: string;
       try {
-        result = await this.lm.complete({ messages });
-      } catch (err) {
-        try {
-          result = await this.lm.completion(messages, {
-            n_predict: 500,
-            temperature: 0.7,
-          });
-          if (result && result.text) {
-            result = { response: result.text, error: null };
-          }
-        } catch (err2) {
-          throw new Error(`Model inference failed: ${err2}`);
-        }
-      }
-      
-      if (result.error) {
-        console.error('Error generating related facts:', result.error);
+        response = await this.runCompletion(messages, {
+          temperature: 0.7,
+          maxTokens: 512,
+        });
+      } catch (completionError) {
+        console.error('Error generating related facts:', completionError);
         return [];
       }
-
-      const response = result.response || '';
       
       // Parse facts from response
       const facts = response
@@ -375,6 +526,114 @@ Related facts:`;
     } catch (error) {
       console.error('Error generating related facts:', error);
       throw error;
+    }
+  }
+
+  private parseQuizBatch(raw: string, expected: number): QuizQuestion[] {
+    const arrayMatch = raw.match(/\[[\s\S]*\]/);
+    if (!arrayMatch) {
+      return [];
+    }
+
+    const candidates = new Set<string>();
+    const base = arrayMatch[0].trim();
+    candidates.add(base);
+
+    const sanitizedKeys = base.replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":');
+    const sanitizedValues = sanitizedKeys.replace(/'([^']*)'/g, (_, value: string) => {
+      const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      return `"${escaped}"`;
+    });
+    const sanitizedTrailingCommas = sanitizedValues.replace(/,\s*([}\]])/g, '$1');
+    candidates.add(sanitizedTrailingCommas);
+
+    for (const candidate of candidates) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (!Array.isArray(parsed)) {
+          continue;
+        }
+        const questions: QuizQuestion[] = parsed
+          .filter((item: any) => typeof item === 'object' && item !== null)
+          .map((item: any) => {
+            const question = typeof item.question === 'string' ? item.question.trim() : '';
+            const options = Array.isArray(item.options)
+                ? item.options
+                  .filter((option: unknown): option is string => typeof option === 'string' && option.trim().length > 0)
+                  .map((option: string) => option.trim())
+              : [];
+            const numericAnswer = typeof item.correct_answer === 'number' ? item.correct_answer : 0;
+            const normalizedAnswer = Number.isFinite(numericAnswer)
+              ? Math.max(0, Math.min(options.length - 1, Math.floor(numericAnswer)))
+              : 0;
+
+            return {
+              question,
+              options,
+              correct_answer: normalizedAnswer,
+            };
+          })
+          .filter((item) => item.question.length > 0 && item.options.length === 4);
+
+        if (questions.length > 0) {
+          return questions.slice(0, expected > 0 ? expected : questions.length);
+        }
+      } catch {
+        // Try next candidate
+      }
+    }
+
+    return [];
+  }
+
+  async generateQuizQuestions(topic: string, factContents: string[]): Promise<QuizQuestion[]> {
+    await this.ensureInitialized();
+
+    if (!this.lm || factContents.length === 0) {
+      return [];
+    }
+
+    const limitedFacts = factContents.slice(0, 8);
+    const promptFacts = limitedFacts
+      .map((content, index) => `${index + 1}. ${content}`)
+      .join('\n');
+
+    const prompt = `You are creating quiz questions for the topic "${topic}". Use the numbered facts below to generate one multiple-choice question per fact. Each question must test understanding of the fact directly.
+
+Facts:
+${promptFacts}
+
+Return a JSON array where each element is of the form:
+{
+  "question": "Question text?",
+  "options": ["Option A", "Option B", "Option C", "Option D"],
+  "correct_answer": 0
+}
+
+Rules:
+- Provide exactly ${limitedFacts.length} quiz objects in the same order as the facts above.
+- Use double quotes around all keys and string values.
+- Each options array must contain four concise answers (<80 characters).
+- Set correct_answer to the zero-based index of the correct option.
+- Reply with JSON only.`;
+
+    const messages: CompletionMessage[] = [{ role: 'user', content: prompt }];
+
+    try {
+      const response = await this.runCompletion(messages, {
+        temperature: 0.35,
+        maxTokens: 512,
+        stopSequences: ['```'],
+      });
+
+      const parsed = this.parseQuizBatch(response, limitedFacts.length);
+      if (parsed.length === 0) {
+        console.warn('[AIService] Quiz generation returned no valid items.');
+      }
+      return parsed;
+    } catch (error) {
+      console.warn('[AIService] Quiz generation failed. Skipping quizzes.', error);
+      return [];
     }
   }
 
@@ -391,12 +650,15 @@ Related facts:`;
   async destroy(): Promise<void> {
     if (this.lm) {
       try {
-        await this.lm.destroy();
+        if (typeof this.lm.destroy === 'function') {
+          await this.lm.destroy();
+        }
       } catch (error) {
         console.error('Error destroying model:', error);
       }
       this.lm = null;
       this.initialized = false;
+      this.currentModelId = null;
     }
   }
 }
