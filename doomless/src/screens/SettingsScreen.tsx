@@ -23,6 +23,7 @@ import {
 } from '../store/brainStore';
 import { CategoryKind, MAX_ENABLED_CATEGORIES } from '../types/categories';
 import { detectSourceType, sortCategoriesForDisplay } from '../utils/categoryUtils';
+import { documentIngestionService } from '../services/DocumentIngestionService';
 
 export const SettingsScreen: React.FC = () => {
   const resetAll = useBrainStore((state: BrainState) => state.resetAll);
@@ -36,6 +37,7 @@ export const SettingsScreen: React.FC = () => {
 
   const [renameTargetId, setRenameTargetId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [isImporting, setIsImporting] = useState(false);
 
   const enabledCount = useMemo(
     () => categories.filter((category) => category.enabled).length,
@@ -88,7 +90,12 @@ export const SettingsScreen: React.FC = () => {
   };
 
   const handleImportSource = async () => {
+    let createdCategoryId: string | null = null;
     try {
+      if (isImporting) {
+        return;
+      }
+      setIsImporting(true);
       // Once the LLM/RAG pipeline lands, this picker response will seed ingestion for embeddings.
       const files = await pick({
         presentationStyle: 'fullScreen',
@@ -115,21 +122,57 @@ export const SettingsScreen: React.FC = () => {
         createdAt: Date.now(),
       });
 
+      if (!result.success) {
+        Alert.alert('Import failed', 'We could not register that source. Please try again.');
+        return;
+      }
+
       if (!result.enabled && result.reason) {
         Alert.alert('Category added', `${name} was added but left disabled.\n${result.reason}`);
       }
+
+      if (!result.categoryId) {
+        throw new Error('Unable to register the new category for ingestion.');
+      }
+
+      createdCategoryId = result.categoryId;
+
+      const { factCount } = await documentIngestionService.ingest({
+        categoryId: result.categoryId,
+        categoryName: name,
+        fileUri: uri,
+        fileName: name,
+        mimeType: file.type,
+      });
+
+      if (factCount === 0) {
+        deleteCategory(result.categoryId);
+        createdCategoryId = null;
+        Alert.alert(
+          'No facts extracted',
+          'We could not extract any facts from that file. The category has been removed.',
+        );
+        return;
+      }
+
+      Alert.alert('Import complete', `Added ${factCount} new facts from “${name}”.`);
     } catch (error) {
       if (isErrorWithCode(error) && error.code === errorCodes.OPERATION_CANCELED) {
         return;
       }
       console.warn('Failed to import file', error);
       Alert.alert('Import failed', 'Something went wrong while importing the file.');
+      if (createdCategoryId) {
+        deleteCategory(createdCategoryId);
+      }
+    } finally {
+      setIsImporting(false);
     }
   };
 
   const handleReset = () => {
     Alert.alert(
-      'Reset CurioSwipe',
+      'Reset DoomLess',
       'This will clear your local progress and preferences. Continue?',
       [
         {
@@ -153,16 +196,23 @@ export const SettingsScreen: React.FC = () => {
         style={styles.scroll}
         contentContainerStyle={styles.container}
         showsVerticalScrollIndicator={false}
+        nestedScrollEnabled
       >
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Sources &amp; Categories</Text>
-          <TouchableOpacity style={styles.importCard} onPress={handleImportSource}>
+          <TouchableOpacity
+            style={[styles.importCard, isImporting && styles.importCardDisabled]}
+            onPress={handleImportSource}
+            disabled={isImporting}
+          >
             <View style={styles.importIconBadge}>
               <Text style={styles.importIconText}>＋</Text>
             </View>
             <View style={styles.importCopy}>
               <Text style={styles.importTitle}>Import source file</Text>
-              <Text style={styles.importSubtitle}>PDF, TXT, or Word document</Text>
+              <Text style={styles.importSubtitle}>
+                {isImporting ? 'Processing with your offline model…' : 'PDF, TXT, or Word document'}
+              </Text>
             </View>
           </TouchableOpacity>
 
@@ -170,6 +220,7 @@ export const SettingsScreen: React.FC = () => {
             <ScrollView
               contentContainerStyle={styles.categoryListContent}
               showsVerticalScrollIndicator={false}
+              nestedScrollEnabled
             >
               {sortedCategories.map((category) => {
                 const isImported = category.kind === CategoryKind.Imported;
@@ -189,7 +240,6 @@ export const SettingsScreen: React.FC = () => {
                       <View style={styles.categoryTextGroup}>
                         <Text
                           style={[styles.categoryName, !category.enabled && styles.categoryNameDisabled]}
-                          numberOfLines={1}
                         >
                           {category.name}
                         </Text>
@@ -294,86 +344,89 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   container: {
-    paddingHorizontal: 24,
-    paddingTop: 32,
-    paddingBottom: 48,
-    gap: 24,
+    paddingHorizontal: 20,
+    paddingTop: 24,
+    paddingBottom: 36,
+    gap: 18,
   },
   section: {
     backgroundColor: '#fdfdfd',
-    borderRadius: 24,
-    padding: 24,
+    borderRadius: 20,
+    padding: 18,
     borderWidth: 1.5,
     borderColor: '#cbd5f5',
     shadowColor: '#000',
     shadowOpacity: 0.08,
     shadowRadius: 18,
-    elevation: 6,
-    gap: 14,
+    elevation: 4,
+    gap: 12,
   },
   sectionTitle: {
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: '700',
     color: '#0f172a',
   },
   sectionBody: {
-    fontSize: 16,
+    fontSize: 14,
     color: '#475569',
-    lineHeight: 24,
+    lineHeight: 20,
   },
   importCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 16,
+    gap: 12,
     backgroundColor: '#eef2ff',
-    borderRadius: 20,
-    paddingVertical: 16,
-    paddingHorizontal: 20,
+    borderRadius: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+  },
+  importCardDisabled: {
+    opacity: 0.6,
   },
   importIconBadge: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     backgroundColor: '#2563eb',
     alignItems: 'center',
     justifyContent: 'center',
   },
   importIconText: {
-    fontSize: 22,
+    fontSize: 20,
     color: '#f8fafc',
     marginTop: -2,
   },
   importCopy: {
     flex: 1,
-    gap: 2,
+    gap: 1,
   },
   importTitle: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '600',
     color: '#1e293b',
   },
   importSubtitle: {
-    fontSize: 14,
+    fontSize: 13,
     color: '#475569',
   },
   categoryListShell: {
-    maxHeight: 320,
-    borderRadius: 20,
+    maxHeight: 280,
+    borderRadius: 16,
     borderWidth: 1,
     borderColor: '#dbeafe',
     backgroundColor: '#f8fafc',
     overflow: 'hidden',
   },
   categoryListContent: {
-    paddingVertical: 4,
+    paddingVertical: 2,
   },
   categoryRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    gap: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    gap: 12,
   },
   categoryRowDisabled: {
     opacity: 0.7,
@@ -381,68 +434,71 @@ const styles = StyleSheet.create({
   categoryInfo: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    gap: 10,
     flex: 1,
+    minWidth: 0,
   },
   categoryEmoji: {
-    fontSize: 20,
+    fontSize: 18,
   },
   categoryTextGroup: {
     flex: 1,
-    gap: 4,
+    gap: 3,
+    minWidth: 0,
   },
   categoryName: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '600',
     color: '#0f172a',
+    flexShrink: 1,
   },
   categoryNameDisabled: {
     color: '#475569',
   },
   categoryMeta: {
-    fontSize: 13,
+    fontSize: 12,
     color: '#64748b',
   },
   categoryActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
+    gap: 8,
   },
   categoryActionButtons: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: 6,
   },
   iconButton: {
-    paddingHorizontal: 6,
-    paddingVertical: 4,
-    borderRadius: 12,
+    paddingHorizontal: 5,
+    paddingVertical: 3,
+    borderRadius: 10,
     backgroundColor: '#e2e8f0',
   },
   iconButtonText: {
-    fontSize: 16,
+    fontSize: 15,
   },
   iconButtonDisabled: {
     opacity: 0.4,
   },
   categoryHint: {
-    fontSize: 14,
+    fontSize: 13,
     color: '#475569',
     marginTop: -4,
   },
   resetButton: {
-    marginTop: 12,
+    marginTop: 10,
     backgroundColor: '#ef4444',
     borderRadius: 999,
-    paddingVertical: 16,
+    paddingVertical: 12,
     alignItems: 'center',
     shadowColor: '#ef4444',
-    shadowOpacity: 0.35,
-    shadowRadius: 18,
-    elevation: 4,
+    shadowOpacity: 0.28,
+    shadowRadius: 12,
+    elevation: 3,
   },
   resetButtonLabel: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '600',
     color: '#ffffff',
   },

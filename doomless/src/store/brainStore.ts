@@ -28,6 +28,7 @@ export type ImportCategoryResult = {
   success: boolean;
   enabled: boolean;
   reason?: string;
+  categoryId?: CategoryId;
 };
 
 export type ToggleCategoryResult = {
@@ -114,6 +115,7 @@ export type BrainState = {
   categories: CategoryDefinition[];
   seenCardIds: string[];
   hasHydrated: boolean;
+  contentRevision: number;
   recordFactInteraction: (category: CategoryId, action: FactAction) => void;
   recordQuizResult: (category: CategoryId, correct: boolean) => void;
   addSeenCard: (id: string) => void;
@@ -125,6 +127,7 @@ export type BrainState = {
   toggleCategoryEnabled: (id: CategoryId, enabled: boolean) => ToggleCategoryResult;
   renameCategory: (id: CategoryId, name: string) => void;
   deleteCategory: (id: CategoryId) => void;
+  bumpContentRevision: () => void;
 };
 
 export const useBrainStore = create<BrainState>()(
@@ -142,6 +145,7 @@ export const useBrainStore = create<BrainState>()(
       categories: createDefaultCategories(),
       seenCardIds: [],
       hasHydrated: false,
+      contentRevision: 0,
       recordFactInteraction: (category: CategoryId, action: FactAction) => {
         set((state) => {
           const profile = cloneProfile(state.profile);
@@ -190,7 +194,7 @@ export const useBrainStore = create<BrainState>()(
       resetAll: async () => {
         const categories = createDefaultCategories();
         const profile = buildInitialBrainProfile(categories.map((category) => category.id));
-        set({ profile, categories, seenCardIds: [] });
+        set({ profile, categories, seenCardIds: [], contentRevision: 0 });
         try {
           await AsyncStorage.removeItem(STORAGE_KEY);
         } catch (error) {
@@ -228,6 +232,7 @@ export const useBrainStore = create<BrainState>()(
           result = {
             success: true,
             enabled: shouldEnable,
+            categoryId: newCategory.id,
             reason: shouldEnable
               ? undefined
               : `You can only have ${MAX_ENABLED_CATEGORIES} active categories.`,
@@ -306,6 +311,9 @@ export const useBrainStore = create<BrainState>()(
           return { categories, profile };
         });
       },
+      bumpContentRevision: () => {
+        set((state) => ({ contentRevision: state.contentRevision + 1 }));
+      },
     }),
     {
       name: STORAGE_KEY,
@@ -314,6 +322,7 @@ export const useBrainStore = create<BrainState>()(
         profile: state.profile,
         seenCardIds: state.seenCardIds,
         categories: state.categories,
+        contentRevision: state.contentRevision,
       }),
       onRehydrateStorage: () => (state: BrainState | undefined, error?: unknown) => {
         if (error) {
@@ -340,3 +349,5 @@ export const recordQuiz = (category: CategoryId, correct: boolean) =>
 export const getHasHydrated = () => useBrainStore.getState().hasHydrated;
 export const getEnabledCategoryIds = (): CategoryId[] =>
   selectEnabledCategories().map((category) => category.id);
+export const bumpContentRevision = () => useBrainStore.getState().bumpContentRevision();
+export const getContentRevision = () => useBrainStore.getState().contentRevision;

@@ -84,6 +84,12 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        
+        // Exclude problematic architectures for cactus-react-native
+        // Only build for arm64-v8a (most real devices)
+        ndk {
+            abiFilters "arm64-v8a"
+        }
     }
     signingConfigs {
         debug {
@@ -103,6 +109,13 @@ android {
             signingConfig signingConfigs.debug
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
+        }
+    }
+    
+    // Explicitly exclude x86_64 from packaging
+    packagingOptions {
+        jniLibs {
+            excludes += ['**/x86/**', '**/x86_64/**', '**/armeabi-v7a/**']
         }
     }
 }
